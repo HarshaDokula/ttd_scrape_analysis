@@ -8,12 +8,14 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
+from openai import RateLimitError
 import logging
 import sys
-from prompt_templates import ttd_prompt_tmpl
+from prompt_templates import ttd_prompt_tmpl, ttd_prompt_tmpl2
 import time
 from tqdm import tqdm
 import pickle
+from completions import OpenAICompletionClient, PerplexityCompletionClient
 
 logs_path = Path("logs")
 logs_path.mkdir(parents=True, exist_ok=True)
@@ -30,15 +32,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 article_ids = []
+max_attempts = 3
 # Load env vars from your config .env file
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+PERPLEXITY_MODEL = os.getenv("PERPLEXITYAI_MODEL", "sonar")
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITYAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
+client = PerplexityCompletionClient(
+    api_key=PERPLEXITY_API_KEY,
+    model=PERPLEXITY_MODEL
+)
 # ---------------------------
-# GPT-based article classifier
+# LLM-based article classifier
 # ---------------------------
 
 def classify_article_with_gpt(title: str, content: str) -> str:
@@ -57,20 +64,28 @@ def classify_article_with_gpt(title: str, content: str) -> str:
     snippet = (content or "")[:800]
 
     
-    prompt = ttd_prompt_tmpl.format(title=title.strip(), article_text=snippet.strip())
+    prompt = ttd_prompt_tmpl2.format(title=title.strip(), article_text=snippet.strip())
     # logger.info(f"prompt: {prompt}")
 
     # Call OpenAI API
     # Use a very low max_tokens to ensure we only get the label
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": "You classify TTD news articles."},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=2,
-        temperature=0.01
-    )
+    attempts=0
+    while attempts  < max_attempts:
+        try:
+            resp = client.chat_completion(
+            prompt=prompt,
+            max_tokens=2,
+            temperature=0.01,  # Low temperature for deterministic output
+            extra_body={"disable_search": True}  # Disable search for Perplexity
+            )
+            break
+        except RateLimitError as rate:
+            attempts +=1
+            logger.warning(f"RateLimitError encounteredon attempt {attempts}. Sleeping for 10 seconds before retrying...")
+            time.sleep(10)
+    else:
+        raise RateLimitError
+    
     logger.info(resp)
     label = resp.choices[0].message.content.strip().lower()
     logger.info(f"predicted label: {label}")
@@ -125,7 +140,10 @@ def process_record(row: Dict[str, str]) -> None:
     content = (row.get("content") or "").strip()
     article_id = (row.get("article_id") or "").strip()
 
-    classification = classify_article_with_gpt(title, content)
+    try:
+        classification = classify_article_with_gpt(title, content)
+    except RateLimitError as rate:
+        raise RateLimitError
     if classification != "true":
         return
     article_ids.append(article_id)
@@ -162,11 +180,15 @@ def main():
         with open(csv_file, encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in tqdm(reader):
-                process_record(row)
+                try:
+                    process_record(row)
+                except RateLimitError:
+                    logger.warning(f"Couldn't get a successful completions even after retrying, ratelimitted, continuing to the next record.")
+                    continue
 
     finalize_output()
 
 if __name__ == "__main__":
     main()
-    with open('article_ids.pkl','wb') as fp:
+    with open('article_ids3.pkl','wb') as fp:
         pickle.dump(article_ids,fp)
