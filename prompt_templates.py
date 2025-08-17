@@ -39,3 +39,62 @@ Article text: {article_text}
 
 answer:
 '''
+
+# ttd_info_extract_prompt_tmpl = '''
+# You are an information extractor for news articles from the Tirumala Tirupati Devasthanams (TTD).
+
+# Your task is to extract the following information from the article text following these rules:
+# - A JSON Date of the article. For any missing parts of the date (year, month, or day), use 0. For example, if only "September 31" is provided, output {{"date":{{"year":null,"month":9,"day":31}}}}; if all parts are present, use them.
+# - Number of pilgrims visiting Tirumala in the article text
+# - Any other relevant metrics mentioned in the article
+# - If the article does not contain any of the above information, return null for each field.
+# - DO not deviate from the rules or create incorrect information.
+
+# ### OUTPUT FORMAT
+# Return a JSON object with the following fields:
+# ```json
+# {{
+#     "date":{{
+#         "year": <digit year from the article content or 0 if not present>,
+#         "month": <digit month from the article or 0 if not present>,
+#         "day": <digit day from the article content or 0 if not present>
+#     }},
+#     "pilgrim_count": <number>,
+#     "other_metrics": <any other relevant metrics>
+# }}
+# ```
+
+# ### INPUT
+# Aritcle text: {article_text}
+
+# Here's the json object with the extracted information:
+# '''
+
+ttd_info_extract_prompt_tmpl = '''
+You are an information extractor for news articles from the Tirumala Tirupati Devasthanams (TTD).
+
+Your task is to extract the following information from the article text following these rules:
+- Day of the article. If the day is not present in the article, use null. For example, if only "September" is provided, output {{"day":null}}; if the text contains "September 9", output {{"day":9}}.
+- Number of pilgrims visiting Tirumala in the article text
+- Any other relevant metrics mentioned in the article
+- If the article does not contain any of the above information, return null for each field.
+- DO not deviate from the rules or create incorrect information.
+
+### OUTPUT FORMAT
+Return a JSON object with the following fields:
+```json
+{{
+    
+    "day": <digit day from the article content or null if not present>,
+    "pilgrim_count": <number>,
+    "other_metrics": <any other relevant metrics>
+}}
+```
+
+### INPUT
+Aritcle text: {article_text}
+
+Here's the json object with the extracted information:
+```json
+
+'''

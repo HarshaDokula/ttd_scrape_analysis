@@ -5,7 +5,7 @@ class OpenAICompletionClient:
         self.model = model
         self.client = OpenAI(api_key=api_key)
 
-    def chat_completion(self, prompt, max_tokens=150, temperature=None, extra_body=None):
+    def chat_completion(self, prompt, max_tokens=150, temperature=None, stop=None):
         """
         Calls the OpenAI chat completion API with a preset system message.
         """
@@ -17,11 +17,12 @@ class OpenAICompletionClient:
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
+            "stream": False,
+            "stop": stop
         }
+
         if temperature is not None:
             params["temperature"] = temperature
-        if extra_body:
-            params["extra_body"] = extra_body
 
         response = self.client.chat.completions.create(**params)
         return response

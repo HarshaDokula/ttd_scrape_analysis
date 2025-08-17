@@ -11,7 +11,7 @@ from openai import OpenAI
 from openai import RateLimitError
 import logging
 import sys
-from prompt_templates import ttd_prompt_tmpl, ttd_prompt_tmpl2
+from prompt_templates import ttd_prompt_tmpl, ttd_prompt_tmpl2, ttd_info_extract_prompt_tmpl
 import time
 from tqdm import tqdm
 import pickle
@@ -44,6 +44,11 @@ client = PerplexityCompletionClient(
     api_key=PERPLEXITY_API_KEY,
     model=PERPLEXITY_MODEL
 )
+
+client_openai = OpenAICompletionClient(
+    api_key=OPENAI_API_KEY,
+    model=OPENAI_MODEL
+)
 # ---------------------------
 # LLM-based article classifier
 # ---------------------------
@@ -57,7 +62,7 @@ def classify_article_with_gpt(title: str, content: str) -> str:
         title (str): The article title.
         content (str): The article content.
     Returns:
-        str: Classification label, either 'darshan' or 'other'.
+        str: Classification label, either 'true' or 'false'.
     """
     # Limit content length to keep costs low
     # TODO:we could do nlp preprocessing here like removing stopwords,lemmatization, etc. if we want to reduce tokens, better than truncating randomly
@@ -72,7 +77,7 @@ def classify_article_with_gpt(title: str, content: str) -> str:
     attempts=0
     while attempts  < max_attempts:
         try:
-            resp = client.chat_completion(
+            resp = client_openai.chat_completion(
             prompt=prompt,
             max_tokens=2,
             temperature=0.01,  # Low temperature for deterministic output
@@ -101,39 +106,68 @@ def classify_article_with_gpt(title: str, content: str) -> str:
 
 _DARSHAN_ROWS: Dict[str, Dict[str, Any]] = {}
 
-def _normalize_year(y: int) -> int:
-    return 2000 + y if 0 <= y < 100 else y
 
-def _best_effort_iso_date(row: Dict[str, str], title: str, content: str) -> Optional[str]:
-    # Simple: if row['year'], row['month'], try to guess day from title
-    y_csv = row.get("year")
-    m_csv = row.get("month")
+def _extract_metrics(content: str) -> Dict[str, Optional[Any]]:
+    """
+    Extracts date, pilgrim count, and other metrics from the content.
+    Returns a dictionary with the extracted information.
+    """
+    
+    extractor_prompt = ttd_info_extract_prompt_tmpl.format(article_text=content.strip())
+    logger.info(f"extractor prompt: {extractor_prompt}")
 
-    m_day = re.search(r"\b([A-Z][a-z]+)\s+(\d{1,2})\b", title)
-    if m_day and y_csv:
-        month_name, day = m_day.group(1), int(m_day.group(2))
-        month_map = {m.lower(): i for i, m in enumerate(
-            ["January","February","March","April","May","June",
-             "July","August","September","October","November","December"], 1)}
-        if month_name.lower() in month_map:
-            try:
-                return datetime(int(y_csv), month_map[month_name.lower()], day).date().isoformat()
-            except ValueError:
-                pass
-
-    if y_csv and m_csv:
+    attempts=0
+    while attempts  < max_attempts:
         try:
-            return datetime(int(y_csv), int(m_csv), 1).date().isoformat()
-        except ValueError:
-            return None
-    return None
-
-def _extract_metrics(title: str, content: str) -> Dict[str, Any]:
-    metrics = {}
-    m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)\s+pilgrims?\s+had", title, re.I)
-    if m:
-        metrics["total_pilgrims"] = int(m.group(1).replace(",", ""))
+            info = client_openai.chat_completion(
+            prompt=extractor_prompt,max_tokens=200,
+            temperature=0.01,  # Low temperature for deterministic output
+            # stop="```"  # Stop sequence to end the response
+        )
+            break
+        except RateLimitError as rate:
+            attempts +=1
+            logger.warning(f"RateLimitError encounteredon attempt {attempts}. Sleeping for 10 seconds before retrying...")
+            time.sleep(10)
+    else:
+        raise RateLimitError
+    
+    logger.info(info)
+    metrics = info.choices[0].message.content.strip().lower()
+    logger.info(f"extracted metrics: {metrics}")
+    
     return metrics
+
+#this function needed if we use perplexity client beacause perplexity doesn't have a stop word param so we get json prefixed with with ```json
+# and suffixed with ```
+def extract_json(text: str) -> dict:
+    """
+    Extracts a JSON object from the provided text.
+    
+    The function looks for the first occurrence of '{'
+    and the last occurrence of '}' in the string,
+    extracts that substring and tries to parse it as JSON.
+    
+    Returns the JSON object (as a dict) if successful, otherwise None.
+    """
+    import json
+
+    # Find the boundaries of the JSON object
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1:
+        return None
+
+    json_str = text[start:end+1]
+    
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        logger.error("JSON decode error:", e)
+        logger.error("Raw metrics:", text)
+        return None
+
+    return data  
 
 def process_record(row: Dict[str, str]) -> None:
     title = (row.get("title") or "").strip()
@@ -147,18 +181,38 @@ def process_record(row: Dict[str, str]) -> None:
     if classification != "true":
         return
     article_ids.append(article_id)
-    date_iso = _best_effort_iso_date(row, title, content)
-    if not date_iso:
-        logger.info(f"date_iso not found")
-        return
 
-    data = _extract_metrics(title, content)
+    # data = extract_json(_extract_metrics(content))
+    
+    try:
+        datastr = _extract_metrics(content)
+        data = json.loads(datastr)
+    except json.JSONDecodeError as e:
+        logger.error("JSON decode error:", e)
+        logger.error("Raw metrics:", datastr)
     payload = {
         "article_id": row.get("article_id"),
         "title": title,
         "post": row.get("link"),
         "data": data
     }
+    # year,month,day = data['date']['year'], data['date']['month'], data['date']['day']
+    day = data['date']['day']
+    date_iso = ""
+
+    # year = "0000" if year == 0 else str(year)
+    # month = "00" if month == 0 else str(month)
+    day = "00" if day == 0 else str(day)
+    
+    #TODO:
+    # get month and year from the file and place here
+    # date_iso = f"{year}-{month.zfill(2)}-{day.zfill(2)}" # 0000-00-00
+
+
+    if date_iso == "00":
+        logger.warning(f"Skipping record with invalid date: {date_iso}")
+        return
+    
     _DARSHAN_ROWS[date_iso] = payload
 
 def finalize_output(out_path: Path = Path("darshan_data.json")) -> None:
