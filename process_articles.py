@@ -3,179 +3,246 @@ import csv
 import json
 import os
 import re
-import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
+from openai import RateLimitError
+import logging
+import sys
+from prompt_templates import ttd_prompt_tmpl, ttd_prompt_tmpl2, ttd_info_extract_prompt_tmpl
+import time
+from tqdm import tqdm
+import pickle
+from completions import OpenAICompletionClient, PerplexityCompletionClient
 
-# ---------------------------
-# Setup logging
-# ---------------------------
+logs_path = Path("logs")
+logs_path.mkdir(parents=True, exist_ok=True)
+
+# Create a new log file name with timestamp
+log_filename = logs_path / f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[logging.FileHandler(Path(log_filename))]
 )
 
+logger = logging.getLogger(__name__)
+
+article_ids = []
+max_attempts = 3
 # Load env vars from your config .env file
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+PERPLEXITY_MODEL = os.getenv("PERPLEXITYAI_MODEL", "sonar")
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITYAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = PerplexityCompletionClient(
+    api_key=PERPLEXITY_API_KEY,
+    model=PERPLEXITY_MODEL
+)
 
+client_openai = OpenAICompletionClient(
+    api_key=OPENAI_API_KEY,
+    model=OPENAI_MODEL
+)
 # ---------------------------
-# GPT-based article classifier (batched)
+# LLM-based article classifier
 # ---------------------------
 
-def classify_articles_with_gpt(batch: List[Dict[str, str]]) -> List[str]:
+def classify_article_with_gpt(title: str, content: str) -> str:
     """
-    Calls GPT to classify multiple articles into 'darshan' or 'other'.
-    Returns a list of labels in the same order as the batch.
+    Calls GPT to classify an article into 'darshan' or 'other'.
+    Returns the string 'darshan' or 'other'.
+
+    Args:
+        title (str): The article title.
+        content (str): The article content.
+    Returns:
+        str: Classification label, either 'true' or 'false'.
     """
-    # Build prompt for all items in batch
-    prompt_lines = [
-        "You are a classifier for news articles from the Tirumala Tirupati Devasthanams (TTD).",
-        "Given each article title and snippet, classify strictly as one of:",
-        "- darshan: Daily/periodic pilgrim statistics at Tirumala, e.g., 'About 64,801 pilgrims had Srivari darshan...'",
-        "- other: All other news (festivals, dignitaries visits, events, admin notices, etc.)",
-        "Respond with one label per line in the same order, ONLY 'darshan' or 'other'.",
-        ""
-    ]
+    # Limit content length to keep costs low
+    # TODO:we could do nlp preprocessing here like removing stopwords,lemmatization, etc. if we want to reduce tokens, better than truncating randomly
+    snippet = (content or "")[:800]
 
-    for i, item in enumerate(batch, start=1):
-        snippet = (item["content"] or "")[:800]
-        prompt_lines.append(f"Article {i}:\nTitle: {item['title'].strip()}\nSnippet: {snippet.strip()}")
-        prompt_lines.append("")
+    
+    prompt = ttd_prompt_tmpl2.format(title=title.strip(), article_text=snippet.strip())
+    # logger.info(f"prompt: {prompt}")
 
-    prompt = "\n".join(prompt_lines)
-
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": "You classify TTD news articles."},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=len(batch) * 5,
-        temperature=0
-    )
-
-    lines = [line.strip().lower() for line in resp.choices[0].message.content.strip().splitlines()]
-    # Ensure we always return the right length
-    labels = []
-    for label in lines:
-        if label not in ("darshan", "other"):
-            labels.append("other")
-        else:
-            labels.append(label)
-
-    # If API returned fewer lines than batch size
-    while len(labels) < len(batch):
-        labels.append("other")
-
-    return labels
+    # Call OpenAI API
+    # Use a very low max_tokens to ensure we only get the label
+    attempts=0
+    while attempts  < max_attempts:
+        try:
+            resp = client_openai.chat_completion(
+            prompt=prompt,
+            max_tokens=2,
+            temperature=0.01,  # Low temperature for deterministic output
+            extra_body={"disable_search": True}  # Disable search for Perplexity
+            )
+            break
+        except RateLimitError as rate:
+            attempts +=1
+            logger.warning(f"RateLimitError encounteredon attempt {attempts}. Sleeping for 10 seconds before retrying...")
+            time.sleep(10)
+    else:
+        raise RateLimitError
+    
+    logger.info(resp)
+    label = resp.choices[0].message.content.strip().lower()
+    logger.info(f"predicted label: {label}")
+    if label not in ("true", "false"):
+        logger.info(f"Unexpected label: {label}, defaulting to 'false'")
+        label = "false"
+    return label
 
 # ---------------------------
-# Parsing logic (unchanged)
+# Your existing parsing logic
+# (only shortened here for clarity)
 # ---------------------------
 
 _DARSHAN_ROWS: Dict[str, Dict[str, Any]] = {}
 
-def _normalize_year(y: int) -> int:
-    return 2000 + y if 0 <= y < 100 else y
 
-def _best_effort_iso_date(row: Dict[str, str], title: str, content: str) -> Optional[str]:
-    y_csv = row.get("year")
-    m_csv = row.get("month")
+def _extract_metrics(content: str) -> Dict[str, Optional[Any]]:
+    """
+    Extracts date, pilgrim count, and other metrics from the content.
+    Returns a dictionary with the extracted information.
+    """
+    
+    extractor_prompt = ttd_info_extract_prompt_tmpl.format(article_text=content.strip())
+    logger.info(f"extractor prompt: {extractor_prompt}")
 
-    m_day = re.search(r"\b([A-Z][a-z]+)\s+(\d{1,2})\b", title)
-    if m_day and y_csv:
-        month_name, day = m_day.group(1), int(m_day.group(2))
-        month_map = {m.lower(): i for i, m in enumerate(
-            ["January","February","March","April","May","June",
-             "July","August","September","October","November","December"], 1)}
-        if month_name.lower() in month_map:
-            try:
-                return datetime(int(y_csv), month_map[month_name.lower()], day).date().isoformat()
-            except ValueError:
-                pass
-
-    if y_csv and m_csv:
+    attempts=0
+    while attempts  < max_attempts:
         try:
-            return datetime(int(y_csv), int(m_csv), 1).date().isoformat()
-        except ValueError:
-            return None
-    return None
-
-def _extract_metrics(title: str, content: str) -> Dict[str, Any]:
-    metrics = {}
-    m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)\s+pilgrims?\s+had", title, re.I)
-    if m:
-        metrics["total_pilgrims"] = int(m.group(1).replace(",", ""))
+            info = client_openai.chat_completion(
+            prompt=extractor_prompt,max_tokens=200,
+            temperature=0.01,  # Low temperature for deterministic output
+            # stop="```"  # Stop sequence to end the response
+        )
+            break
+        except RateLimitError as rate:
+            attempts +=1
+            logger.warning(f"RateLimitError encounteredon attempt {attempts}. Sleeping for 10 seconds before retrying...")
+            time.sleep(10)
+    else:
+        raise RateLimitError
+    
+    logger.info(info)
+    metrics = info.choices[0].message.content.strip().lower()
+    logger.info(f"extracted metrics: {metrics}")
+    
     return metrics
 
-def process_records(rows: List[Dict[str, str]]) -> None:
-    batch_labels = classify_articles_with_gpt(rows)
-    for row, classification in zip(rows, batch_labels):
-        if classification != "darshan":
-            continue
-        title = (row.get("title") or "").strip()
-        content = (row.get("content") or "").strip()
-        date_iso = _best_effort_iso_date(row, title, content)
-        if not date_iso:
-            continue
-        data = _extract_metrics(title, content)
-        payload = {
-            "article_id": row.get("article_id"),
-            "title": title,
-            "post": row.get("link"),
-            "data": data
-        }
-        _DARSHAN_ROWS[date_iso] = payload
+#this function needed if we use perplexity client beacause perplexity doesn't have a stop word param so we get json prefixed with with ```json
+# and suffixed with ```
+def extract_json(text: str) -> dict:
+    """
+    Extracts a JSON object from the provided text.
+    
+    The function looks for the first occurrence of '{'
+    and the last occurrence of '}' in the string,
+    extracts that substring and tries to parse it as JSON.
+    
+    Returns the JSON object (as a dict) if successful, otherwise None.
+    """
+    import json
+
+    # Find the boundaries of the JSON object
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1:
+        return None
+
+    json_str = text[start:end+1]
+    
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        logger.error("JSON decode error:", e)
+        logger.error("Raw metrics:", text)
+        return None
+
+    return data  
+
+def process_record(row: Dict[str, str]) -> None:
+    title = (row.get("title") or "").strip()
+    content = (row.get("content") or "").strip()
+    article_id = (row.get("article_id") or "").strip()
+
+    try:
+        classification = classify_article_with_gpt(title, content)
+    except RateLimitError as rate:
+        raise RateLimitError
+    if classification != "true":
+        return
+    article_ids.append(article_id)
+
+    # data = extract_json(_extract_metrics(content))
+    
+    try:
+        datastr = _extract_metrics(content)
+        data = json.loads(datastr)
+    except json.JSONDecodeError as e:
+        logger.error("JSON decode error:", e)
+        logger.error("Raw metrics:", datastr)
+    payload = {
+        "article_id": row.get("article_id"),
+        "title": title,
+        "post": row.get("link"),
+        "data": data
+    }
+    # year,month,day = data['date']['year'], data['date']['month'], data['date']['day']
+    day = data['date']['day']
+    date_iso = ""
+
+    # year = "0000" if year == 0 else str(year)
+    # month = "00" if month == 0 else str(month)
+    day = "00" if day == 0 else str(day)
+    
+    #TODO:
+    # get month and year from the file and place here
+    # date_iso = f"{year}-{month.zfill(2)}-{day.zfill(2)}" # 0000-00-00
+
+
+    if date_iso == "00":
+        logger.warning(f"Skipping record with invalid date: {date_iso}")
+        return
+    
+    _DARSHAN_ROWS[date_iso] = payload
 
 def finalize_output(out_path: Path = Path("darshan_data.json")) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(_DARSHAN_ROWS, f, ensure_ascii=False, indent=2)
-    logging.info(f"Saved {len(_DARSHAN_ROWS)} Darshan records to {out_path}")
-
-# ---------------------------
-# Main entry
-# ---------------------------
+    print(f"Saved {len(_DARSHAN_ROWS)} Darshan records to {out_path}")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("data_dir", type=str)
-    parser.add_argument("--batch-size", type=int, default=10, help="Number of rows per GPT request")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
-    logging.info(f"Processing directory: {data_dir}")
-
-    for csv_file in data_dir.glob("*.csv"):
-        logging.info(f"Reading file: {csv_file}")
+    csv_files = list(data_dir.glob("*.csv"))
+    logger.info(f"Found {len(csv_files)} CSV files in {data_dir}")
+    logger.info(f"Processing files {csv_files}")
+    for csv_file in csv_files:
+        logger.info(f"Processing file: {csv_file}")
         with open(csv_file, encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            batch = []
-            for row in reader:
-                batch.append({
-                    "title": row.get("title", ""),
-                    "content": row.get("content", ""),
-                    "article_id": row.get("article_id", ""),
-                    "link": row.get("link", ""),
-                    "year": row.get("year", ""),
-                    "month": row.get("month", "")
-                })
-                if len(batch) >= args.batch_size:
-                    logging.info(f"Classifying batch of {len(batch)} rows from {csv_file.name}")
-                    process_records(batch)
-                    batch = []
-            # Process remaining rows
-            if batch:
-                logging.info(f"Classifying final batch of {len(batch)} rows from {csv_file.name}")
-                process_records(batch)
+            for row in tqdm(reader):
+                try:
+                    process_record(row)
+                except RateLimitError:
+                    logger.warning(f"Couldn't get a successful completions even after retrying, ratelimitted, continuing to the next record.")
+                    continue
 
     finalize_output()
 
 if __name__ == "__main__":
     main()
+    with open('article_ids3.pkl','wb') as fp:
+        pickle.dump(article_ids,fp)
