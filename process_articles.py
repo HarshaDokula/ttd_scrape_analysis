@@ -11,6 +11,10 @@ from typing import Any, Dict
 
 from tqdm import tqdm
 
+
+from dotenv import load_dotenv
+load_dotenv()
+
 # ---------------------------
 # Logging Setup
 # ---------------------------
@@ -29,22 +33,15 @@ def setup_logger() -> logging.Logger:
 logger = setup_logger()
 
 # ---------------------------
-# Import Client from factory
+# Provider Factory
 # ---------------------------
-from client_factory import get_client
-client, client_type, RateLimitError = get_client()
+from provider_factory import get_provider
 
-# ---------------------------
-# Prompt Templates
-# ---------------------------
-from prompt_templates import (
-    ttd_prompt_tmpl2,
-    ttd_info_extract_prompt_tmpl,
-)
+provider = get_provider()
 
 article_ids = []
-max_attempts = 3
 _DARSHAN_ROWS: Dict[str, Dict[str, Any]] = {}
+max_attempts = 3
 
 # ---------------------------
 # Utility: Extract JSON safely
@@ -67,69 +64,6 @@ def extract_json(text: str) -> dict:
     return data
 
 # ---------------------------
-# Classification Function
-# ---------------------------
-def classify_article(title: str, content: str) -> str:
-    snippet = (content or "")[:800]
-    prompt = ttd_prompt_tmpl2.format(title=title.strip(), article_text=snippet.strip())
-
-    attempts = 0
-    while attempts < max_attempts:
-        try:
-            extra_kwargs = {"extra_body": {"disable_search": True}} if client_type == "perplexity" else {}
-            token_param = {"max_completion_tokens": 2} if client_type == "openai" else {"max_tokens": 2}
-            resp = client.chat_completion(
-                prompt=prompt,
-                temperature=0.01,
-                **token_param,
-                **extra_kwargs
-            )
-            break
-        except RateLimitError:
-            attempts += 1
-            logger.warning(f"RateLimitError attempt {attempts}. Sleeping before retry...")
-            time.sleep(10)
-    else:
-        raise RateLimitError
-
-    label = resp.choices[0].message.content.strip().lower()
-    return label if label in ("true", "false") else "false"
-
-# ---------------------------
-# Metric Extraction
-# ---------------------------
-def _extract_metrics(content: str) -> str:
-    extractor_prompt = ttd_info_extract_prompt_tmpl.format(article_text=content.strip())
-    attempts = 0
-
-    while attempts < max_attempts:
-        try:
-            extra_kwargs = {"extra_body": {"disable_search": True}} if client_type == "perplexity" else {}
-            token_param = {"max_completion_tokens": 200} if client_type == "openai" else {"max_tokens": 200}
-            info = client.chat_completion(
-                prompt=extractor_prompt,
-                temperature=0.01,
-                **token_param,
-                **extra_kwargs
-            )
-            break
-        except RateLimitError:
-            attempts += 1
-            logger.warning(f"RateLimitError attempt {attempts}. Sleeping before retry...")
-            time.sleep(10)
-    else:
-        raise RateLimitError
-
-    datastr = info.choices[0].message.content.strip()
-
-    if datastr.startswith("```"):
-        datastr = datastr.strip("`\n")
-        if datastr.lower().startswith("json"):
-            datastr = datastr[4:].strip()
-
-    return datastr
-
-# ---------------------------
 # Processing
 # ---------------------------
 def process_record(row: Dict[str, str], year: str, month: str) -> None:
@@ -137,12 +71,38 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
     content = (row.get("content") or "").strip()
     article_id = (row.get("article_id") or "").strip()
 
-    classification = classify_article(title, content)
+    # Retry wrapper
+    attempts = 0
+    while attempts < max_attempts:
+        try:
+            classification = provider.classify_article(title, content)
+            break
+        except Exception:
+            attempts += 1
+            logger.warning(f"Rate limit or error in classification attempt {attempts}. Sleeping 10s...")
+            time.sleep(10)
+    else:
+        logger.warning(f"Skipping record {article_id} due to repeated classification errors.")
+        return
+
     if classification != "true":
         return
     article_ids.append(article_id)
 
-    datastr = _extract_metrics(content)
+    # Extract metrics
+    attempts = 0
+    while attempts < max_attempts:
+        try:
+            datastr = provider.extract_metrics(content)
+            break
+        except Exception:
+            attempts += 1
+            logger.warning(f"Rate limit or error in extraction attempt {attempts}. Sleeping 10s...")
+            time.sleep(10)
+    else:
+        logger.warning(f"Skipping record {article_id} due to repeated extraction errors.")
+        return
+
     data = extract_json(datastr)
     if not data:
         return
@@ -201,15 +161,11 @@ def main():
         with open(csv_file, encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in tqdm(reader):
-                try:
-                    process_record(row, year, month)
-                except RateLimitError:
-                    logger.warning("Rate limit hit, skipping record.")
-                    continue
+                process_record(row, year, month)
 
     finalize_output()
 
-    with open("article_ids3.pkl", "wb") as fp:
+    with open("article_ids.pkl", "wb") as fp:
         pickle.dump(article_ids, fp)
 
 if __name__ == "__main__":
