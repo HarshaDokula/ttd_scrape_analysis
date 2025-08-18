@@ -3,7 +3,7 @@ import os
 from providers.provider_base import BaseProvider
 from prompt_templates import ttd_prompt_tmpl2, ttd_info_extract_prompt_tmpl
 from openai import OpenAI
-from openai.error import RateLimitError
+from openai import RateLimitError
 
 class PerplexityProvider(BaseProvider):
     def __init__(self, api_key: str = None, model: str = None):
@@ -23,12 +23,12 @@ class PerplexityProvider(BaseProvider):
                 model=self.model,
                 messages=messages,
                 temperature=0.01,
-                max_tokens=200,
+                max_tokens=2,
                 stream=False,
                 extra_body={"disable_search": True}  # Perplexity-specific
             )
             return resp.choices[0].message.content.strip().lower()
-        except RateLimitError as e:
+        except Exception as e:
             raise e
 
     def extract_metrics(self, content: str) -> str:
@@ -42,10 +42,10 @@ class PerplexityProvider(BaseProvider):
                 model=self.model,
                 messages=messages,
                 temperature=0.01,
-                max_tokens=600,
+                max_tokens=100,
                 stream=False,
                 extra_body={"disable_search": True}  # Perplexity-specific
             )
             return resp.choices[0].message.content.strip()
-        except RateLimitError as e:
+        except Exception as e:
             raise e

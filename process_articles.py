@@ -77,9 +77,9 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
         try:
             classification = provider.classify_article(title, content)
             break
-        except Exception:
+        except Exception as e:
             attempts += 1
-            logger.warning(f"Rate limit or error in classification attempt {attempts}. Sleeping 10s...")
+            logger.warning(f"{e} \n Rate limit or error in classification attempt {attempts}. Sleeping 10s...")
             time.sleep(10)
     else:
         logger.warning(f"Skipping record {article_id} due to repeated classification errors.")

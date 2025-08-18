@@ -15,11 +15,11 @@ class OpenAIProvider(BaseProvider):
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.01,
-                max_tokens=200
+                #temperature=0.01,
+                max_completion_tokens=2
             )
             return resp.choices[0].message.content.strip().lower()
-        except RateLimitError as e:
+        except Exception as e:
             raise e
 
     def extract_metrics(self, content: str) -> str:
@@ -28,9 +28,9 @@ class OpenAIProvider(BaseProvider):
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.01,
-                max_tokens=600
+                #temperature=0.01,
+                max_tokens=100
             )
             return resp.choices[0].message.content.strip()
-        except RateLimitError as e:
+        except Exception as e:
             raise e
