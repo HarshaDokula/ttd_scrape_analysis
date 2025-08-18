@@ -47,6 +47,26 @@ max_attempts = 3
 _DARSHAN_ROWS: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------
+# Utility: Extract JSON safely
+# ---------------------------
+def extract_json(text: str) -> dict:
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1:
+        return None
+
+    json_str = text[start:end+1]
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        logger.error("JSON decode error: %s", e)
+        logger.error("Raw metrics: %s", text)
+        return None
+
+    return data
+
+# ---------------------------
 # Classification Function
 # ---------------------------
 def classify_article(title: str, content: str) -> str:
@@ -57,10 +77,11 @@ def classify_article(title: str, content: str) -> str:
     while attempts < max_attempts:
         try:
             extra_kwargs = {"extra_body": {"disable_search": True}} if client_type == "perplexity" else {}
+            token_param = {"max_completion_tokens": 2} if client_type == "openai" else {"max_tokens": 2}
             resp = client.chat_completion(
                 prompt=prompt,
-                max_tokens=2,
                 temperature=0.01,
+                **token_param,
                 **extra_kwargs
             )
             break
@@ -83,10 +104,13 @@ def _extract_metrics(content: str) -> str:
 
     while attempts < max_attempts:
         try:
+            extra_kwargs = {"extra_body": {"disable_search": True}} if client_type == "perplexity" else {}
+            token_param = {"max_completion_tokens": 200} if client_type == "openai" else {"max_tokens": 200}
             info = client.chat_completion(
                 prompt=extractor_prompt,
-                max_tokens=200,
                 temperature=0.01,
+                **token_param,
+                **extra_kwargs
             )
             break
         except RateLimitError:
@@ -96,12 +120,19 @@ def _extract_metrics(content: str) -> str:
     else:
         raise RateLimitError
 
-    return info.choices[0].message.content.strip()
+    datastr = info.choices[0].message.content.strip()
+
+    if datastr.startswith("```"):
+        datastr = datastr.strip("`\n")
+        if datastr.lower().startswith("json"):
+            datastr = datastr[4:].strip()
+
+    return datastr
 
 # ---------------------------
 # Processing
 # ---------------------------
-def process_record(row: Dict[str, str]) -> None:
+def process_record(row: Dict[str, str], year: str, month: str) -> None:
     title = (row.get("title") or "").strip()
     content = (row.get("content") or "").strip()
     article_id = (row.get("article_id") or "").strip()
@@ -112,10 +143,8 @@ def process_record(row: Dict[str, str]) -> None:
     article_ids.append(article_id)
 
     datastr = _extract_metrics(content)
-    try:
-        data = json.loads(datastr)
-    except json.JSONDecodeError:
-        logger.error(f"JSON decode error. Raw: {datastr}")
+    data = extract_json(datastr)
+    if not data:
         return
 
     payload = {
@@ -126,11 +155,16 @@ def process_record(row: Dict[str, str]) -> None:
     }
 
     day = data.get("date", {}).get("day", "00")
-    day = "00" if day == 0 else str(day)
+    day = "00" if day == 0 else str(day).zfill(2)
 
-    date_iso = ""  # TODO: add proper year/month parsing
-    if date_iso == "00":
-        logger.warning(f"Skipping record with invalid date: {date_iso}")
+    try:
+        date_iso = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+    except Exception:
+        logger.warning(f"Skipping record with invalid date components: year={year}, month={month}, day={day}")
+        return
+
+    if day == "00":
+        logger.warning(f"Skipping record with invalid day in date: {date_iso}")
         return
 
     _DARSHAN_ROWS[date_iso] = payload
@@ -157,11 +191,18 @@ def main():
 
     for csv_file in csv_files:
         logger.info(f"Processing file: {csv_file}")
+        stem_parts = csv_file.stem.split("_")
+        if len(stem_parts) >= 3:
+            year, month = stem_parts[1], stem_parts[2]
+        else:
+            logger.error(f"Filename format unexpected: {csv_file.name}")
+            continue
+
         with open(csv_file, encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in tqdm(reader):
                 try:
-                    process_record(row)
+                    process_record(row, year, month)
                 except RateLimitError:
                     logger.warning("Rate limit hit, skipping record.")
                     continue
@@ -170,7 +211,6 @@ def main():
 
     with open("article_ids3.pkl", "wb") as fp:
         pickle.dump(article_ids, fp)
-
 
 if __name__ == "__main__":
     main()
