@@ -28,8 +28,9 @@ class OpenAIProvider(BaseProvider):
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                #temperature=0.01,
-                max_tokens=100
+                temperature=0.01,
+                max_tokens=200,
+                stop="```"
             )
             return resp.choices[0].message.content.strip()
         except Exception as e:

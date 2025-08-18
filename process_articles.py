@@ -8,6 +8,7 @@ import sys
 import time
 import pickle
 from typing import Any, Dict
+from openai import RateLimitError
 
 from tqdm import tqdm
 
@@ -54,6 +55,7 @@ def extract_json(text: str) -> dict:
 
     json_str = text[start:end+1]
 
+
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
@@ -76,7 +78,12 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
     while attempts < max_attempts:
         try:
             classification = provider.classify_article(title, content)
+            logger.info(f"Classified article {article_id} as {classification}")
             break
+        except RateLimitError as e:
+            attempts += 1
+            logger.warning(f"Rate limit error in classification attempt {attempts}. Sleeping 10s...")
+            time.sleep(10)
         except Exception as e:
             attempts += 1
             logger.warning(f"{e} \n Rate limit or error in classification attempt {attempts}. Sleeping 10s...")
@@ -104,6 +111,7 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
         return
 
     data = extract_json(datastr)
+    logger.info(f"Extracted data for article {article_id}: {data}")
     if not data:
         return
 
@@ -114,8 +122,8 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
         "data": data,
     }
 
-    day = data.get("date", {}).get("day", "00")
-    day = "00" if day == 0 else str(day).zfill(2)
+    day = data['day']
+    day = "00" if (day == 0 or day==None) else str(day).zfill(2)
 
     try:
         date_iso = f"{year}-{month.zfill(2)}-{day.zfill(2)}"

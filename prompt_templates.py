@@ -95,6 +95,4 @@ Return a JSON object with the following fields:
 Aritcle text: {article_text}
 
 Here's the json object with the extracted information:
-```json
-
-'''
+```json'''

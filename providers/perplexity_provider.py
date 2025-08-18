@@ -42,7 +42,7 @@ class PerplexityProvider(BaseProvider):
                 model=self.model,
                 messages=messages,
                 temperature=0.01,
-                max_tokens=100,
+                max_tokens=200,
                 stream=False,
                 extra_body={"disable_search": True}  # Perplexity-specific
             )
