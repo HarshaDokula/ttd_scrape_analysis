@@ -11,8 +11,6 @@ from typing import Any, Dict
 from openai import RateLimitError
 
 from tqdm import tqdm
-
-
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -55,7 +53,6 @@ def extract_json(text: str) -> dict:
 
     json_str = text[start:end+1]
 
-
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
@@ -73,14 +70,14 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
     content = (row.get("content") or "").strip()
     article_id = (row.get("article_id") or "").strip()
 
-    # Retry wrapper
+    # Retry wrapper for classification
     attempts = 0
     while attempts < max_attempts:
         try:
             classification = provider.classify_article(title, content)
             logger.info(f"Classified article {article_id} as {classification}")
             break
-        except RateLimitError as e:
+        except RateLimitError:
             attempts += 1
             logger.warning(f"Rate limit error in classification attempt {attempts}. Sleeping 10s...")
             time.sleep(10)
@@ -96,7 +93,7 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
         return
     article_ids.append(article_id)
 
-    # Extract metrics
+    # Retry wrapper for extraction
     attempts = 0
     while attempts < max_attempts:
         try:
@@ -123,7 +120,7 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
     }
 
     day = data['day']
-    day = "00" if (day == 0 or day==None) else str(day).zfill(2)
+    day = "00" if (day == 0 or day is None) else str(day).zfill(2)
 
     try:
         date_iso = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
@@ -157,24 +154,31 @@ def main():
     csv_files = list(data_dir.glob("*.csv"))
     logger.info(f"Found {len(csv_files)} CSV files in {data_dir}")
 
-    for csv_file in csv_files:
-        logger.info(f"Processing file: {csv_file}")
-        stem_parts = csv_file.stem.split("_")
-        if len(stem_parts) >= 3:
-            year, month = stem_parts[1], stem_parts[2]
-        else:
-            logger.error(f"Filename format unexpected: {csv_file.name}")
-            continue
+    try:
+        for csv_file in csv_files:
+            logger.info(f"Processing file: {csv_file}")
+            stem_parts = csv_file.stem.split("_")
+            if len(stem_parts) >= 3:
+                year, month = stem_parts[1], stem_parts[2]
+            else:
+                logger.error(f"Filename format unexpected: {csv_file.name}")
+                continue
 
-        with open(csv_file, encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in tqdm(reader):
-                process_record(row, year, month)
+            with open(csv_file, encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in tqdm(reader):
+                    process_record(row, year, month)
 
-    finalize_output()
-
-    with open("article_ids.pkl", "wb") as fp:
-        pickle.dump(article_ids, fp)
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user. Saving progress before exit...")
+    except Exception as e:
+        logger.error(f"Fatal error occurred: {e}", exc_info=True)
+    finally:
+        # Always save progress
+        finalize_output()
+        with open("article_ids.pkl", "wb") as fp:
+            pickle.dump(article_ids, fp)
+        logger.info("Progress saved. Exiting.")
 
 if __name__ == "__main__":
     main()
