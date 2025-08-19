@@ -15,7 +15,7 @@ class OpenAIProvider(BaseProvider):
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                #temperature=0.01,
+                temperature=0.01,
                 max_completion_tokens=2
             )
             return resp.choices[0].message.content.strip().lower()
@@ -29,7 +29,7 @@ class OpenAIProvider(BaseProvider):
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.01,
-                max_tokens=200,
+                max_completion_tokens=200,
                 stop="```"
             )
             return resp.choices[0].message.content.strip()
