@@ -120,6 +120,8 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
     }
 
     day = data['day']
+    del data['day'] #day no longer necessary in the data
+
     day = "00" if (day == 0 or day is None) else str(day).zfill(2)
 
     try:
@@ -131,8 +133,12 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
     if day == "00":
         logger.warning(f"Skipping record with invalid day in date: {date_iso}")
         return
-
-    _DARSHAN_ROWS[date_iso] = payload
+    
+    if date_iso in _DARSHAN_ROWS:
+       if _DARSHAN_ROWS[date_iso]['data']['pilgrim_count'] < payload['data']['pilgrim_count']:
+              _DARSHAN_ROWS[date_iso] = payload
+    else:
+       _DARSHAN_ROWS[date_iso] = payload
 
 # ---------------------------
 # Output
