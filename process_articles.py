@@ -12,7 +12,12 @@ from openai import RateLimitError
 
 from tqdm import tqdm
 from dotenv import load_dotenv
+import pandas as pd
+
 load_dotenv()
+
+
+FAILED_RECORDS: list[dict[str,str|int]] = []
 
 # ---------------------------
 # Logging Setup
@@ -83,7 +88,7 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
             time.sleep(10)
         except Exception as e:
             attempts += 1
-            logger.warning(f"{e} \n Rate limit or error in classification attempt {attempts}. Sleeping 10s...")
+            logger.warning(f"{e} \nAnything other than Rate limit error in classification attempt {attempts}. Sleeping 10s...")
             time.sleep(10)
     else:
         logger.warning(f"Skipping record {article_id} due to repeated classification errors.")
@@ -105,6 +110,7 @@ def process_record(row: Dict[str, str], year: str, month: str) -> None:
             time.sleep(10)
     else:
         logger.warning(f"Skipping record {article_id} due to repeated extraction errors.")
+        FAILED_RECORDS.append({'article_id':article_id,'title':title,'content':content})
         return
 
     data = extract_json(datastr)
@@ -147,6 +153,13 @@ def finalize_output(out_path: Path = Path("darshan_data.json")) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(_DARSHAN_ROWS, f, ensure_ascii=False, indent=2)
     print(f"Saved {len(_DARSHAN_ROWS)} Darshan records to {out_path}")
+    print(FAILED_RECORDS)
+    df = pd.DataFrame(FAILED_RECORDS)
+    print(df.dtypes)
+    df.to_csv("failed_records.csv", index=False)
+    logger.info(f"Saved {len(FAILED_RECORDS)} failed records to failed_records.csv")
+
+    
 
 # ---------------------------
 # Main
