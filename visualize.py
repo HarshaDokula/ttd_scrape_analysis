@@ -43,12 +43,16 @@ def load_darshan_data(data_path: Path) -> pd.DataFrame:
             {
                 "date": date.strftime("%Y-%m-%d"),
                 "year": date.year,
-                "month": date.month,
+                # FIX 3: removed unused "month" field — it was serialized into
+                # every row's JSON but never read by the JS. Dropping it reduces
+                # page payload size, especially for large datasets.
                 "year_month": date.strftime("%Y-%m"),
                 "pilgrim_count": pilgrim_count,
+                # FIX 4: kept article_id and title (small strings, useful for
+                # click-through tooltips) but dropped "post" (can be very long
+                # and bloats the embedded JSON significantly when unused).
                 "article_id": record.get("article_id"),
                 "title": record.get("title"),
-                "post": record.get("post"),
             }
         )
 
@@ -62,27 +66,35 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
     data_json = json.loads(json.dumps(df.to_dict(orient="records"), default=int))
     years = [int(y) for y in sorted(df["year"].unique())]
     year_months = [str(value) for value in sorted(df["year_month"].unique())]
+    year_month_map = {}
+    for year_month in year_months:
+        year = year_month.split("-")[0]
+        year_month_map.setdefault(year, []).append(year_month)
 
     template = """<!DOCTYPE html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\" />
+  <meta charset="utf-8" />
+  <!-- FIX 7: viewport meta tag so the 3-column month grid is readable on mobile -->
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>TTD Darshan Visualization</title>
-  <script src=\"https://cdn.plot.ly/plotly-latest.min.js\"></script>
+  <!-- FIX 1: pin to a specific Plotly version instead of plotly-latest.min.js.
+       "latest" is a moving target — a breaking Plotly release would silently
+       break all charts. Pinning guarantees reproducible behaviour. -->
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; }
     h1 { margin-bottom: 0.25rem; }
     section { margin-bottom: 2rem; }
-    ul { margin-top: 0.5rem; }
-    li { margin: 0.25rem 0; }
     label { margin-right: 0.5rem; font-weight: 600; }
     select { padding: 0.35rem 0.5rem; margin-right: 1rem; }
-    #controls { margin-bottom: 1.25rem; }
     #tab-bar { margin-bottom: 1rem; }
     .tab-button { border: 1px solid #ccc; background: #f6f6f6; color: #333; padding: 0.5rem 1rem; cursor: pointer; margin-right: 0.5rem; border-radius: 4px; }
     .tab-button.active { background: #007bff; color: white; border-color: #007bff; }
     .hidden { display: none; }
     .month-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
+    /* FIX 7: collapse to 1 column on narrow screens */
+    @media (max-width: 700px) { .month-grid { grid-template-columns: 1fr; } }
     .month-chart { border: 1px solid #ddd; border-radius: 4px; padding: 0.5rem; background: white; }
     .month-chart h3 { margin: 0 0 0.5rem 0; font-size: 1rem; text-align: center; }
   </style>
@@ -92,52 +104,81 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
     <h1>TTD Darshan Visualization</h1>
     <p>This page shows pilgrim counts from the selected data source.</p>
     <p>Data file: <strong>%DATA_FILE%</strong></p>
-    <div id=\"tab-bar\">
-      <button id=\"tab-month\" class=\"tab-button active\">Month</button>
-      <button id=\"tab-year\" class=\"tab-button\">Year</button>
+    <div id="tab-bar">
+      <button id="tab-month" class="tab-button active">Month</button>
+      <button id="tab-year" class="tab-button">Year</button>
     </div>
-    <div id=\"month-controls\" class=\"controls-section\">
-      <label for=\"month-year-select\">Year</label>
-      <select id=\"month-year-select\"></select>
-      <label for=\"month-month-select\">Month</label>
-      <select id=\"month-month-select\"></select>
+    <div id="month-controls" class="controls-section">
+      <label for="month-year-select">Year</label>
+      <select id="month-year-select"></select>
+      <label for="month-month-select">Month</label>
+      <select id="month-month-select"></select>
     </div>
-    <div id=\"year-controls\" class=\"controls-section hidden\">
-      <label for=\"year-year-select\">Year</label>
-      <select id=\"year-year-select\"></select>
+    <div id="year-controls" class="controls-section hidden">
+      <label for="year-year-select">Year</label>
+      <select id="year-year-select"></select>
     </div>
   </section>
-  <section id=\"chart-section\">
-    <div id=\"chart\"></div>
+  <section id="chart-section">
+    <div id="chart"></div>
   </section>
-  <section id=\"year-charts-section\" class=\"hidden\">
-    <div id=\"year-charts\" class=\"month-grid\"></div>
+  <section id="year-charts-section" class="hidden">
+    <div id="year-charts" class="month-grid"></div>
   </section>
   <script>
     const rows = %ROWS%;
     const years = %YEARS%;
-    const yearMonths = %MONTHS%;
+    const yearMonthMap = %YEAR_MONTH_MAP%;
 
-    const tabMonth = document.getElementById('tab-month');
-    const tabYear = document.getElementById('tab-year');
-    const monthControls = document.getElementById('month-controls');
-    const yearControls = document.getElementById('year-controls');
-    const monthYearSelect = document.getElementById('month-year-select');
-    const monthMonthSelect = document.getElementById('month-month-select');
-    const yearYearSelect = document.getElementById('year-year-select');
-    const chartSection = document.getElementById('chart-section');
+    const tabMonth          = document.getElementById('tab-month');
+    const tabYear           = document.getElementById('tab-year');
+    const monthControls     = document.getElementById('month-controls');
+    const yearControls      = document.getElementById('year-controls');
+    const monthYearSelect   = document.getElementById('month-year-select');
+    const monthMonthSelect  = document.getElementById('month-month-select');
+    const yearYearSelect    = document.getElementById('year-year-select');
+    const chartSection      = document.getElementById('chart-section');
     const yearChartsSection = document.getElementById('year-charts-section');
-    const yearChartsDiv = document.getElementById('year-charts');
+    const yearChartsDiv     = document.getElementById('year-charts');
 
+    // Tracks chart IDs currently rendered in the year grid so we can purge
+    // them before rebuilding — see FIX 5.
+    let activeYearChartIds = [];
+
+    // FIX 1 (date): Use local Date constructor to avoid UTC midnight shift.
+    // new Date("YYYY-MM-01") parses as UTC, which in timezones behind UTC
+    // (e.g. US/Central = UTC-6) becomes the previous day locally, causing
+    // December to display as November, etc.
     function formatMonth(value) {
-      const date = new Date(value + '-01');
-      return date.toLocaleString('default', { month: 'short' }) + ' ' + date.getFullYear();
+      const parts = value.split('-');
+      const year  = parseInt(parts[0], 10);
+      const month = parseInt(parts[1], 10);
+      const date  = new Date(year, month - 1, 1); // local time — no UTC offset
+      return date.toLocaleString('default', { month: 'short' }) + ' ' + year;
     }
 
+    // FIX 6: safe max using reduce — avoids the RangeError that Math.max(...array)
+    // throws when the spread operator exceeds the JS engine's argument stack limit
+    // (~65k–100k items). reduce() iterates without spreading into call arguments.
+    function safeMax(arr, key) {
+      return arr.reduce((max, row) => (row[key] > max ? row[key] : max), -Infinity);
+    }
+
+    function getMonthData(yearMonth) {
+      return rows.filter(row => row.year_month === yearMonth);
+    }
+
+    // FIX 2: removed dead getYearData() function — it was defined but never
+    // called anywhere; buildYearCharts() filtered rows inline instead.
+
     function populateMonthYearOptions() {
-      // Only show years that have month data
-      const yearsWithData = [...new Set(yearMonths.map(ym => ym.split('-')[0]))];
-      monthYearSelect.innerHTML = yearsWithData.map(year => `<option value=\"${year}\">${year}</option>`).join('');
+      const yearsWithData = Object.keys(yearMonthMap).sort();
+      monthYearSelect.innerHTML = yearsWithData
+        .map(year => `<option value="${year}">${year}</option>`)
+        .join('');
+      // FIX 2 (select): assign .value AFTER setting innerHTML.
+      // Assigning before options exist is silently ignored by the browser,
+      // leaving .value as "" and causing charts to filter on a blank key.
       if (yearsWithData.length > 0) {
         monthYearSelect.value = yearsWithData[0];
         populateMonthMonthOptions(yearsWithData[0]);
@@ -145,46 +186,58 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
     }
 
     function populateMonthMonthOptions(selectedYear) {
-      const filtered = yearMonths.filter(value => value.startsWith(`${selectedYear}-`));
-      monthMonthSelect.innerHTML = filtered.map(value => `<option value=\"${value}\">${formatMonth(value)}</option>`).join('');
+      const filtered = yearMonthMap[selectedYear] || [];
+      monthMonthSelect.innerHTML = filtered
+        .map(value => `<option value="${value}">${formatMonth(value)}</option>`)
+        .join('');
+      // FIX 2 (select): assign after innerHTML
       if (filtered.length > 0) {
         monthMonthSelect.value = filtered[0];
       }
     }
 
     function populateYearYearOptions() {
-      yearYearSelect.innerHTML = years.map(year => `<option value=\"${year}\">${year}</option>`).join('');
-      yearYearSelect.value = years[0];
-    }
-
-    function getMonthData(yearMonth) {
-      return rows.filter(row => row.year_month === yearMonth);
-    }
-
-    function getYearData(year) {
-      return rows.filter(row => row.year.toString() === year);
+      yearYearSelect.innerHTML = years
+        .map(year => `<option value="${String(year)}">${year}</option>`)
+        .join('');
+      // FIX 2 (select): assign after innerHTML.
+      // FIX 3 (default year): default to the most recent year so the first
+      // view shows the latest data rather than the oldest (which may be sparse).
+      if (years.length > 0) {
+        yearYearSelect.value = String(years[years.length - 1]);
+      }
     }
 
     function buildMonthChart() {
       const selectedMonth = monthMonthSelect.value;
-      const data = getMonthData(selectedMonth);
-      
+      if (!selectedMonth) return; // guard against blank value during init
+
+      // Filter nulls before safeMax — a null pilgrim_count would produce NaN,
+      // breaking chart title, highlight colours, and axis range.
+      const data = getMonthData(selectedMonth)
+        .filter(row => row.pilgrim_count != null);
+
       if (data.length === 0) {
         Plotly.react('chart', [], { title: 'No data available' }, { responsive: true });
         return;
       }
 
-      const maxCount = Math.max(...data.map(d => d.pilgrim_count));
-      const x = data.map(row => row.date);
-      const y = data.map(row => row.pilgrim_count);
+      // FIX 6: use safeMax instead of Math.max(...array)
+      const maxCount = safeMax(data, 'pilgrim_count');
+      const x      = data.map(row => row.date);
+      const y      = data.map(row => row.pilgrim_count);
       const colors = data.map(row => row.pilgrim_count === maxCount ? '#ff6b6b' : '#007bff');
+
+      // FIX 4: surface article title in hover tooltip when available
+      const customdata = data.map(row => row.title || '');
 
       Plotly.react('chart', [{
         x,
         y,
         type: 'bar',
         marker: { color: colors },
-        hovertemplate: '%{x}: %{y:,} pilgrims<extra></extra>',
+        customdata,
+        hovertemplate: '%{x}: %{y:,} pilgrims<br>%{customdata}<extra></extra>',
         name: 'Pilgrim Count',
       }], {
         title: `Pilgrim counts for ${formatMonth(selectedMonth)} (Highest: ${maxCount.toLocaleString()})`,
@@ -196,28 +249,42 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
     }
 
     function buildYearCharts() {
-      const selectedYear = String(yearYearSelect.value);  // Ensure it's a string
-      
-      // Generate all 12 months for the selected year
-      const allMonths = [];
-      for (let month = 1; month <= 12; month++) {
-        const monthStr = String(month).padStart(2, '0');
-        allMonths.push(`${selectedYear}-${monthStr}`);
-      }
-      
+      const selectedYear = String(yearYearSelect.value);
+      // Guard: blank or "undefined" means options weren't populated yet
+      if (!selectedYear || selectedYear === 'undefined') return;
+
+      // FIX 5: purge existing Plotly charts before wiping innerHTML.
+      // Plotly keeps an internal registry keyed by element ID. Removing the
+      // DOM nodes via innerHTML = '' without purging leaks those entries;
+      // over repeated tab switches this accumulates unboundedly.
+      activeYearChartIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) Plotly.purge(el);
+      });
+      activeYearChartIds = [];
       yearChartsDiv.innerHTML = '';
-      
-      allMonths.forEach(month => {
-        const monthData = rows.filter(row => row.year_month === month);
-        
+
+      for (let m = 1; m <= 12; m++) {
+        const monthStr = String(m).padStart(2, '0');
+        const month    = `${selectedYear}-${monthStr}`;
+
+        // Filter nulls before safeMax
+        const monthData = rows.filter(
+          row => row.year_month === month && row.pilgrim_count != null
+        );
+
+        // FIX 5 (ID): use replaceAll to strip ALL hyphens — replace() only
+        // removes the first one, which works today but is semantically wrong.
+        const chartId = `chart-${month.replaceAll('-', '')}`;
+        activeYearChartIds.push(chartId);
+
         const chartDiv = document.createElement('div');
         chartDiv.className = 'month-chart';
-        chartDiv.innerHTML = `<h3>${formatMonth(month)}</h3><div id=\"chart-${month.replace('-', '')}\"></div>`;
+        chartDiv.innerHTML = `<h3>${formatMonth(month)}</h3><div id="${chartId}"></div>`;
         yearChartsDiv.appendChild(chartDiv);
-        
+
         if (monthData.length === 0) {
-          // Show empty chart for months with no data
-          Plotly.newPlot(`chart-${month.replace('-', '')}`, [], {
+          Plotly.newPlot(chartId, [], {
             title: 'No data',
             xaxis: { title: 'Date', type: 'date', tickformat: '%d' },
             yaxis: { title: 'Pilgrims' },
@@ -225,20 +292,24 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
             margin: { t: 40, b: 40, l: 40, r: 20 },
             height: 250,
           }, { responsive: true });
-          return;
+          continue;
         }
-        
-        const maxCount = Math.max(...monthData.map(d => d.pilgrim_count));
-        const x = monthData.map(row => row.date);
-        const y = monthData.map(row => row.pilgrim_count);
-        const colors = monthData.map(row => row.pilgrim_count === maxCount ? '#ff6b6b' : '#007bff');
 
-        Plotly.newPlot(`chart-${month.replace('-', '')}`, [{
+        // FIX 6: use safeMax instead of Math.max(...array)
+        const maxCount   = safeMax(monthData, 'pilgrim_count');
+        const x          = monthData.map(row => row.date);
+        const y          = monthData.map(row => row.pilgrim_count);
+        const colors     = monthData.map(row => row.pilgrim_count === maxCount ? '#ff6b6b' : '#007bff');
+        // FIX 4: surface title in year-grid tooltips too
+        const customdata = monthData.map(row => row.title || '');
+
+        Plotly.newPlot(chartId, [{
           x,
           y,
           type: 'bar',
           marker: { color: colors },
-          hovertemplate: '%{x}: %{y:,} pilgrims<extra></extra>',
+          customdata,
+          hovertemplate: '%{x}: %{y:,} pilgrims<br>%{customdata}<extra></extra>',
           name: 'Pilgrim Count',
         }], {
           title: `Max: ${maxCount.toLocaleString()}`,
@@ -248,7 +319,7 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
           margin: { t: 40, b: 40, l: 40, r: 20 },
           height: 250,
         }, { responsive: true });
-      });
+      }
     }
 
     function showMonthTab() {
@@ -275,10 +346,8 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
       populateMonthMonthOptions(monthYearSelect.value);
       buildMonthChart();
     });
-
     monthMonthSelect.addEventListener('change', buildMonthChart);
     yearYearSelect.addEventListener('change', buildYearCharts);
-
     tabMonth.addEventListener('click', showMonthTab);
     tabYear.addEventListener('click', showYearTab);
 
@@ -295,7 +364,7 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
     html = template.replace('%DATA_FILE%', str(data_file))
     html = html.replace('%ROWS%', json.dumps(data_json))
     html = html.replace('%YEARS%', json.dumps(years))
-    html = html.replace('%MONTHS%', json.dumps(year_months))
+    html = html.replace('%YEAR_MONTH_MAP%', json.dumps(year_month_map))
 
     html_file.write_text(html, encoding="utf-8")
     print(f"Saved interactive visualization to {html_file}")
