@@ -58,43 +58,7 @@ def load_darshan_data(data_path: Path) -> pd.DataFrame:
     return df.sort_values("date")
 
 
-def build_highlights(df: pd.DataFrame) -> str:
-    monthly_best = (
-        df.loc[df.groupby("year_month")["pilgrim_count"].idxmax()]
-        .sort_values(["year", "month"])
-    )
-    best_yearly_month = (
-        monthly_best.loc[monthly_best.groupby("year")["pilgrim_count"].idxmax()]
-        .sort_values("year")
-    )
-
-    month_rows = []
-    for _, row in monthly_best.iterrows():
-        month_rows.append(
-            f"{row.year_month}: {row.pilgrim_count:,} pilgrims (best day: {row.date})"
-        )
-
-    year_rows = []
-    for _, row in best_yearly_month.iterrows():
-        year_rows.append(
-            f"{row.year}: {row.year_month} with {row.pilgrim_count:,} pilgrims"
-        )
-
-    return "\n".join([
-        "<h2>Highlights</h2>",
-        "<h3>Highest-day record for each month</h3>",
-        "<ul>",
-        "".join(f'<li>{item}</li>' for item in month_rows),
-        "</ul>",
-        "<h3>Highest month in each year</h3>",
-        "<ul>",
-        "".join(f'<li>{item}</li>' for item in year_rows),
-        "</ul>",
-    ])
-
-
 def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
-    highlights_html = build_highlights(df)
     data_json = json.loads(json.dumps(df.to_dict(orient="records"), default=int))
     years = [int(y) for y in sorted(df["year"].unique())]
     year_months = [str(value) for value in sorted(df["year_month"].unique())]
@@ -118,6 +82,9 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
     .tab-button { border: 1px solid #ccc; background: #f6f6f6; color: #333; padding: 0.5rem 1rem; cursor: pointer; margin-right: 0.5rem; border-radius: 4px; }
     .tab-button.active { background: #007bff; color: white; border-color: #007bff; }
     .hidden { display: none; }
+    .month-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
+    .month-chart { border: 1px solid #ddd; border-radius: 4px; padding: 0.5rem; background: white; }
+    .month-chart h3 { margin: 0 0 0.5rem 0; font-size: 1rem; text-align: center; }
   </style>
 </head>
 <body>
@@ -126,100 +93,101 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
     <p>This page shows pilgrim counts from the selected data source.</p>
     <p>Data file: <strong>%DATA_FILE%</strong></p>
     <div id=\"tab-bar\">
-      <button id=\"tab-data\" class=\"tab-button active\">Data</button>
-      <button id=\"tab-highlights\" class=\"tab-button\">Highlights</button>
+      <button id=\"tab-month\" class=\"tab-button active\">Month</button>
+      <button id=\"tab-year\" class=\"tab-button\">Year</button>
     </div>
-    <div id=\"controls\">
-      <label for=\"year-select\">Year</label>
-      <select id=\"year-select\"></select>
-      <label for=\"month-select\">Month</label>
-      <select id=\"month-select\"></select>
+    <div id=\"month-controls\" class=\"controls-section\">
+      <label for=\"month-year-select\">Year</label>
+      <select id=\"month-year-select\"></select>
+      <label for=\"month-month-select\">Month</label>
+      <select id=\"month-month-select\"></select>
+    </div>
+    <div id=\"year-controls\" class=\"controls-section hidden\">
+      <label for=\"year-year-select\">Year</label>
+      <select id=\"year-year-select\"></select>
     </div>
   </section>
   <section id=\"chart-section\">
     <div id=\"chart\"></div>
   </section>
-  <section id=\"highlights-section\" class=\"hidden\">
-    %HIGHLIGHTS%
+  <section id=\"year-charts-section\" class=\"hidden\">
+    <div id=\"year-charts\" class=\"month-grid\"></div>
   </section>
   <script>
     const rows = %ROWS%;
     const years = %YEARS%;
     const yearMonths = %MONTHS%;
 
-    const yearSelect = document.getElementById('year-select');
-    const monthSelect = document.getElementById('month-select');
-    const tabData = document.getElementById('tab-data');
-    const tabHighlights = document.getElementById('tab-highlights');
+    const tabMonth = document.getElementById('tab-month');
+    const tabYear = document.getElementById('tab-year');
+    const monthControls = document.getElementById('month-controls');
+    const yearControls = document.getElementById('year-controls');
+    const monthYearSelect = document.getElementById('month-year-select');
+    const monthMonthSelect = document.getElementById('month-month-select');
+    const yearYearSelect = document.getElementById('year-year-select');
     const chartSection = document.getElementById('chart-section');
-    const highlightsSection = document.getElementById('highlights-section');
+    const yearChartsSection = document.getElementById('year-charts-section');
+    const yearChartsDiv = document.getElementById('year-charts');
 
     function formatMonth(value) {
       const date = new Date(value + '-01');
       return date.toLocaleString('default', { month: 'short' }) + ' ' + date.getFullYear();
     }
 
-    function populateYearOptions() {
-      yearSelect.innerHTML = '<option value="all">All</option>' +
-        years.map(year => `<option value="${year}">${year}</option>`).join('');
+    function populateMonthYearOptions() {
+      // Only show years that have month data
+      const yearsWithData = [...new Set(yearMonths.map(ym => ym.split('-')[0]))];
+      monthYearSelect.innerHTML = yearsWithData.map(year => `<option value=\"${year}\">${year}</option>`).join('');
+      if (yearsWithData.length > 0) {
+        monthYearSelect.value = yearsWithData[0];
+        populateMonthMonthOptions(yearsWithData[0]);
+      }
     }
 
-    function populateMonthOptions(selectedYear = 'all') {
-      const filtered = selectedYear === 'all'
-        ? yearMonths
-        : yearMonths.filter(value => value.startsWith(`${selectedYear}-`));
-      monthSelect.innerHTML = ['<option value="all">All</option>']
-        .concat(filtered.map(value => `<option value="${value}">${formatMonth(value)}</option>`))
-        .join('');
+    function populateMonthMonthOptions(selectedYear) {
+      const filtered = yearMonths.filter(value => value.startsWith(`${selectedYear}-`));
+      monthMonthSelect.innerHTML = filtered.map(value => `<option value=\"${value}\">${formatMonth(value)}</option>`).join('');
+      if (filtered.length > 0) {
+        monthMonthSelect.value = filtered[0];
+      }
     }
 
-    function syncYearToMonth() {
-      const selectedMonth = monthSelect.value;
-      if (selectedMonth === 'all') {
+    function populateYearYearOptions() {
+      yearYearSelect.innerHTML = years.map(year => `<option value=\"${year}\">${year}</option>`).join('');
+      yearYearSelect.value = years[0];
+    }
+
+    function getMonthData(yearMonth) {
+      return rows.filter(row => row.year_month === yearMonth);
+    }
+
+    function getYearData(year) {
+      return rows.filter(row => row.year.toString() === year);
+    }
+
+    function buildMonthChart() {
+      const selectedMonth = monthMonthSelect.value;
+      const data = getMonthData(selectedMonth);
+      
+      if (data.length === 0) {
+        Plotly.react('chart', [], { title: 'No data available' }, { responsive: true });
         return;
       }
-      const monthYear = selectedMonth.split('-')[0];
-      if (yearSelect.value !== monthYear) {
-        yearSelect.value = monthYear;
-        populateMonthOptions(monthYear);
-        monthSelect.value = selectedMonth;
-      }
-    }
 
-    function filterRows() {
-      const selectedYear = yearSelect.value;
-      const selectedMonth = monthSelect.value;
-      return rows.filter(row => {
-        if (selectedYear !== 'all' && row.year.toString() !== selectedYear) return false;
-        if (selectedMonth !== 'all' && row.year_month !== selectedMonth) return false;
-        return true;
-      });
-    }
-
-    function buildPlot() {
-      const filtered = filterRows();
-      const x = filtered.map(row => row.date);
-      const y = filtered.map(row => row.pilgrim_count);
-
-      const selectedYear = yearSelect.value;
-      const selectedMonth = monthSelect.value;
-      const titleParts = [];
-      if (selectedYear !== 'all') titleParts.push(`Year ${selectedYear}`);
-      if (selectedMonth !== 'all') titleParts.push(formatMonth(selectedMonth));
-      const titleText = titleParts.length
-        ? `Pilgrim counts for ${titleParts.join(' / ')}`
-        : 'Pilgrim counts for all available dates';
+      const maxCount = Math.max(...data.map(d => d.pilgrim_count));
+      const x = data.map(row => row.date);
+      const y = data.map(row => row.pilgrim_count);
+      const colors = data.map(row => row.pilgrim_count === maxCount ? '#ff6b6b' : '#007bff');
 
       Plotly.react('chart', [{
         x,
         y,
-        mode: 'lines+markers',
-        marker: { size: 7 },
+        type: 'bar',
+        marker: { color: colors },
         hovertemplate: '%{x}: %{y:,} pilgrims<extra></extra>',
-        line: { shape: 'linear' },
         name: 'Pilgrim Count',
       }], {
-        title: titleText,
+        title: `Pilgrim counts for ${formatMonth(selectedMonth)} (Highest: ${maxCount.toLocaleString()})`,
         xaxis: { title: 'Date', type: 'date' },
         yaxis: { title: 'Pilgrim count' },
         template: 'plotly_white',
@@ -227,38 +195,97 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
       }, { responsive: true });
     }
 
-    yearSelect.addEventListener('change', () => {
-      populateMonthOptions(yearSelect.value);
-      monthSelect.value = 'all';
-      buildPlot();
-    });
-    monthSelect.addEventListener('change', () => {
-      syncYearToMonth();
-      buildPlot();
-    });
+    function buildYearCharts() {
+      const selectedYear = String(yearYearSelect.value);  // Ensure it's a string
+      
+      // Generate all 12 months for the selected year
+      const allMonths = [];
+      for (let month = 1; month <= 12; month++) {
+        const monthStr = String(month).padStart(2, '0');
+        allMonths.push(`${selectedYear}-${monthStr}`);
+      }
+      
+      yearChartsDiv.innerHTML = '';
+      
+      allMonths.forEach(month => {
+        const monthData = rows.filter(row => row.year_month === month);
+        
+        const chartDiv = document.createElement('div');
+        chartDiv.className = 'month-chart';
+        chartDiv.innerHTML = `<h3>${formatMonth(month)}</h3><div id=\"chart-${month.replace('-', '')}\"></div>`;
+        yearChartsDiv.appendChild(chartDiv);
+        
+        if (monthData.length === 0) {
+          // Show empty chart for months with no data
+          Plotly.newPlot(`chart-${month.replace('-', '')}`, [], {
+            title: 'No data',
+            xaxis: { title: 'Date', type: 'date', tickformat: '%d' },
+            yaxis: { title: 'Pilgrims' },
+            template: 'plotly_white',
+            margin: { t: 40, b: 40, l: 40, r: 20 },
+            height: 250,
+          }, { responsive: true });
+          return;
+        }
+        
+        const maxCount = Math.max(...monthData.map(d => d.pilgrim_count));
+        const x = monthData.map(row => row.date);
+        const y = monthData.map(row => row.pilgrim_count);
+        const colors = monthData.map(row => row.pilgrim_count === maxCount ? '#ff6b6b' : '#007bff');
 
-    function showDataTab() {
-      tabData.classList.add('active');
-      tabHighlights.classList.remove('active');
+        Plotly.newPlot(`chart-${month.replace('-', '')}`, [{
+          x,
+          y,
+          type: 'bar',
+          marker: { color: colors },
+          hovertemplate: '%{x}: %{y:,} pilgrims<extra></extra>',
+          name: 'Pilgrim Count',
+        }], {
+          title: `Max: ${maxCount.toLocaleString()}`,
+          xaxis: { title: 'Date', type: 'date', tickformat: '%d' },
+          yaxis: { title: 'Pilgrims' },
+          template: 'plotly_white',
+          margin: { t: 40, b: 40, l: 40, r: 20 },
+          height: 250,
+        }, { responsive: true });
+      });
+    }
+
+    function showMonthTab() {
+      tabMonth.classList.add('active');
+      tabYear.classList.remove('active');
+      monthControls.classList.remove('hidden');
+      yearControls.classList.add('hidden');
       chartSection.classList.remove('hidden');
-      highlightsSection.classList.add('hidden');
+      yearChartsSection.classList.add('hidden');
+      buildMonthChart();
     }
 
-    function showHighlightsTab() {
-      tabHighlights.classList.add('active');
-      tabData.classList.remove('active');
-      highlightsSection.classList.remove('hidden');
+    function showYearTab() {
+      tabYear.classList.add('active');
+      tabMonth.classList.remove('active');
+      yearControls.classList.remove('hidden');
+      monthControls.classList.add('hidden');
+      yearChartsSection.classList.remove('hidden');
       chartSection.classList.add('hidden');
+      buildYearCharts();
     }
 
-    tabData.addEventListener('click', showDataTab);
-    tabHighlights.addEventListener('click', showHighlightsTab);
+    monthYearSelect.addEventListener('change', () => {
+      populateMonthMonthOptions(monthYearSelect.value);
+      buildMonthChart();
+    });
+
+    monthMonthSelect.addEventListener('change', buildMonthChart);
+    yearYearSelect.addEventListener('change', buildYearCharts);
+
+    tabMonth.addEventListener('click', showMonthTab);
+    tabYear.addEventListener('click', showYearTab);
 
     window.addEventListener('DOMContentLoaded', () => {
-      populateYearOptions();
-      populateMonthOptions();
-      showDataTab();
-      buildPlot();
+      populateMonthYearOptions();
+      populateYearYearOptions();
+      showMonthTab();
     });
   </script>
 </body>
@@ -266,7 +293,6 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
 """
 
     html = template.replace('%DATA_FILE%', str(data_file))
-    html = html.replace('%HIGHLIGHTS%', highlights_html)
     html = html.replace('%ROWS%', json.dumps(data_json))
     html = html.replace('%YEARS%', json.dumps(years))
     html = html.replace('%MONTHS%', json.dumps(year_months))
