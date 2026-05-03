@@ -84,17 +84,18 @@ class OpenAIProvider:
                 }
             })
 
-        # Submit batch
+        # Upload batch file and submit
         try:
-            batch_file = self.client.beta.files.upload(
+            batch_file = self.client.files.create(
                 file=(
                     "batch_classify.jsonl",
                     self._format_jsonl(batch_requests),
                     "application/json"
                 ),
+                purpose="batch",
             )
             
-            batch = self.client.beta.batches.create(
+            batch = self.client.batches.create(
                 input_file_id=batch_file.id,
                 endpoint="/v1/chat/completions",
                 completion_window="24h",
@@ -134,17 +135,18 @@ class OpenAIProvider:
                 }
             })
 
-        # Submit batch
+        # Upload batch file and submit
         try:
-            batch_file = self.client.beta.files.upload(
+            batch_file = self.client.files.create(
                 file=(
                     "batch_extract.jsonl",
                     self._format_jsonl(batch_requests),
                     "application/json"
                 ),
+                purpose="batch",
             )
             
-            batch = self.client.beta.batches.create(
+            batch = self.client.batches.create(
                 input_file_id=batch_file.id,
                 endpoint="/v1/chat/completions",
                 completion_window="24h",
@@ -169,7 +171,7 @@ class OpenAIProvider:
         attempt = 0
         while attempt < self.max_poll_attempts:
             try:
-                batch = self.client.beta.batches.retrieve(batch_id)
+                batch = self.client.batches.retrieve(batch_id)
                 
                 logger.info(
                     f"Batch {batch_id}: status={batch.status} "
@@ -206,14 +208,14 @@ class OpenAIProvider:
             List of result dicts with 'custom_id' and 'response' keys
         """
         try:
-            batch = self.client.beta.batches.retrieve(batch_id)
+            batch = self.client.batches.retrieve(batch_id)
             
             if not batch.output_file_id:
                 logger.warning(f"No output file for batch {batch_id}")
                 return []
             
             results = []
-            output_file = self.client.beta.files.content(batch.output_file_id)
+            output_file = self.client.files.content(batch.output_file_id)
             
             for line in output_file.text.strip().split('\n'):
                 if line:
@@ -238,14 +240,14 @@ class OpenAIProvider:
             List of error dicts
         """
         try:
-            batch = self.client.beta.batches.retrieve(batch_id)
+            batch = self.client.batches.retrieve(batch_id)
             
             if not batch.error_file_id:
                 logger.info(f"No errors for batch {batch_id}")
                 return []
             
             errors = []
-            error_file = self.client.beta.files.content(batch.error_file_id)
+            error_file = self.client.files.content(batch.error_file_id)
             
             for line in error_file.text.strip().split('\n'):
                 if line:
