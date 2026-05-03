@@ -1,5 +1,9 @@
 # Output data files for this project.
 *.json
+*.pkl
+
+# Test data
+example_data/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

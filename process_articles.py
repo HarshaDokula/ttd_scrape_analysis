@@ -1,181 +1,275 @@
 import argparse
 import csv
 import json
-import os
-import re
-import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional, List
+import logging
+import sys
+import time
+import pickle
+from typing import Any, Dict, Callable
+from openai import RateLimitError
+
+from tqdm import tqdm
 from dotenv import load_dotenv
-from openai import OpenAI
-
-# ---------------------------
-# Setup logging
-# ---------------------------
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO
-)
-
-# Load env vars from your config .env file
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------------------
-# GPT-based article classifier (batched)
+# Logging Setup
 # ---------------------------
+def setup_logger() -> logging.Logger:
+    logs_path = Path("logs")
+    logs_path.mkdir(parents=True, exist_ok=True)
+    log_filename = logs_path / f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-def classify_articles_with_gpt(batch: List[Dict[str, str]]) -> List[str]:
-    """
-    Calls GPT to classify multiple articles into 'darshan' or 'other'.
-    Returns a list of labels in the same order as the batch.
-    """
-    # Build prompt for all items in batch
-    prompt_lines = [
-        "You are a classifier for news articles from the Tirumala Tirupati Devasthanams (TTD).",
-        "Given each article title and snippet, classify strictly as one of:",
-        "- darshan: Daily/periodic pilgrim statistics at Tirumala, e.g., 'About 64,801 pilgrims had Srivari darshan...'",
-        "- other: All other news (festivals, dignitaries visits, events, admin notices, etc.)",
-        "Respond with one label per line in the same order, ONLY 'darshan' or 'other'.",
-        ""
-    ]
-
-    for i, item in enumerate(batch, start=1):
-        snippet = (item["content"] or "")[:800]
-        prompt_lines.append(f"Article {i}:\nTitle: {item['title'].strip()}\nSnippet: {snippet.strip()}")
-        prompt_lines.append("")
-
-    prompt = "\n".join(prompt_lines)
-
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": "You classify TTD news articles."},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=len(batch) * 5,
-        temperature=0
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        level=logging.INFO,
+        handlers=[logging.FileHandler(log_filename), logging.StreamHandler(sys.stdout)]
     )
+    return logging.getLogger(__name__)
 
-    lines = [line.strip().lower() for line in resp.choices[0].message.content.strip().splitlines()]
-    # Ensure we always return the right length
-    labels = []
-    for label in lines:
-        if label not in ("darshan", "other"):
-            labels.append("other")
-        else:
-            labels.append(label)
-
-    # If API returned fewer lines than batch size
-    while len(labels) < len(batch):
-        labels.append("other")
-
-    return labels
+logger = setup_logger()
 
 # ---------------------------
-# Parsing logic (unchanged)
+# Provider Factory
 # ---------------------------
+from provider_factory import get_provider
+provider = get_provider()
 
+# ---------------------------
+# Globals
+# ---------------------------
+article_ids = []
 _DARSHAN_ROWS: Dict[str, Dict[str, Any]] = {}
+failed_records = []   # store failed rows
+max_attempts = 3
 
-def _normalize_year(y: int) -> int:
-    return 2000 + y if 0 <= y < 100 else y
-
-def _best_effort_iso_date(row: Dict[str, str], title: str, content: str) -> Optional[str]:
-    y_csv = row.get("year")
-    m_csv = row.get("month")
-
-    m_day = re.search(r"\b([A-Z][a-z]+)\s+(\d{1,2})\b", title)
-    if m_day and y_csv:
-        month_name, day = m_day.group(1), int(m_day.group(2))
-        month_map = {m.lower(): i for i, m in enumerate(
-            ["January","February","March","April","May","June",
-             "July","August","September","October","November","December"], 1)}
-        if month_name.lower() in month_map:
-            try:
-                return datetime(int(y_csv), month_map[month_name.lower()], day).date().isoformat()
-            except ValueError:
-                pass
-
-    if y_csv and m_csv:
-        try:
-            return datetime(int(y_csv), int(m_csv), 1).date().isoformat()
-        except ValueError:
+# ---------------------------
+# Retry Decorator
+# ---------------------------
+def with_retry(max_attempts: int = 3):
+    """
+    Decorator to retry API calls with exponential backoff.
+    - RateLimitError: sleep 1 hour.
+    - Other exceptions: sleep 10s.
+    - Ctrl+C: stop immediately and let main() save progress.
+    """
+    def decorator(func: Callable):
+        def wrapper(*args, **kwargs):
+            attempts = 0
+            while attempts < max_attempts:
+                try:
+                    return func(*args, **kwargs)
+                except RateLimitError:
+                    attempts += 1
+                    logger.warning(
+                        f"Rate limit error in {func.__name__} attempt {attempts}. Sleeping 1 hour..."
+                    )
+                    try:
+                        time.sleep(3600)
+                    except KeyboardInterrupt:
+                        logger.warning("Interrupted during 1-hour sleep. Saving progress...")
+                        raise
+                except KeyboardInterrupt:
+                    logger.warning(f"Interrupted by user during {func.__name__}. Saving progress...")
+                    raise
+                except Exception as e:
+                    attempts += 1
+                    logger.warning(
+                        f"Error in {func.__name__} attempt {attempts}: {e}. Sleeping 10s..."
+                    )
+                    try:
+                        time.sleep(10)
+                    except KeyboardInterrupt:
+                        logger.warning("Interrupted during sleep. Saving progress...")
+                        raise
+            logger.error(f"Giving up on {func.__name__} after {max_attempts} attempts.")
             return None
-    return None
+        return wrapper
+    return decorator
 
-def _extract_metrics(title: str, content: str) -> Dict[str, Any]:
-    metrics = {}
-    m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)\s+pilgrims?\s+had", title, re.I)
-    if m:
-        metrics["total_pilgrims"] = int(m.group(1).replace(",", ""))
-    return metrics
+# ---------------------------
+# Utility: Extract JSON safely
+# ---------------------------
+def extract_json(text: str) -> dict:
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1:
+        return None
 
-def process_records(rows: List[Dict[str, str]]) -> None:
-    batch_labels = classify_articles_with_gpt(rows)
-    for row, classification in zip(rows, batch_labels):
-        if classification != "darshan":
-            continue
-        title = (row.get("title") or "").strip()
-        content = (row.get("content") or "").strip()
-        date_iso = _best_effort_iso_date(row, title, content)
-        if not date_iso:
-            continue
-        data = _extract_metrics(title, content)
-        payload = {
-            "article_id": row.get("article_id"),
-            "title": title,
-            "post": row.get("link"),
-            "data": data
-        }
-        _DARSHAN_ROWS[date_iso] = payload
+    json_str = text[start:end+1]
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        logger.error("JSON decode error: %s", e)
+        logger.error("Raw metrics: %s", text)
+        return None
+    return data
 
+# ---------------------------
+# Wrapped Provider Calls
+# ---------------------------
+@with_retry(max_attempts)
+def classify_article(title: str, content: str) -> str:
+    return provider.classify_article(title, content)
+
+@with_retry(max_attempts)
+def extract_metrics(content: str) -> str:
+    return provider.extract_metrics(content)
+
+# ---------------------------
+# Processing
+# ---------------------------
+def process_record(row: Dict[str, str], year: str, month: str) -> None:
+    title = (row.get("title") or "").strip()
+    content = (row.get("content") or "").strip()
+    article_id = (row.get("article_id") or "").strip()
+
+    # ---- Classification ----
+    classification = classify_article(title, content)
+    if not classification:
+        failed_records.append(row)
+        return
+    logger.info(f"Classified article {article_id} as {classification}")
+
+    if classification != "true":
+        return
+    article_ids.append(article_id)
+
+    # ---- Metrics Extraction ----
+    datastr = extract_metrics(content)
+    if not datastr:
+        failed_records.append(row)
+        return
+
+    data = extract_json(datastr)
+    logger.info(f"Extracted data for article {article_id}: {data}")
+    if not data:
+        failed_records.append(row)
+        return
+
+    try:
+        day = data['day']
+        del data['day']  # remove day after use
+    except Exception:
+        logger.warning(f"Skipping record {article_id} due to missing 'day' in extracted data.")
+        failed_records.append(row)
+        return
+
+    day = "00" if (day == 0 or day is None) else str(day).zfill(2)
+    try:
+        date_iso = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+    except Exception:
+        logger.warning(f"Skipping record with invalid date components: year={year}, month={month}, day={day}")
+        failed_records.append(row)
+        return
+
+    if day == "00":
+        logger.warning(f"Skipping record with invalid day in date: {date_iso}")
+        failed_records.append(row)
+        return
+
+    payload = {
+        "article_id": article_id,
+        "title": title,
+        "post": row.get("link"),
+        "data": data,
+    }
+
+    # ---- Safe pilgrim_count handling ----
+    for attempt in range(max_attempts):
+        try:
+            new_count = payload['data'].get('pilgrim_count')
+            old_count = _DARSHAN_ROWS.get(date_iso, {}).get('data', {}).get('pilgrim_count')
+
+            if isinstance(new_count, str) and new_count.isdigit():
+                new_count = int(new_count)
+                payload['data']['pilgrim_count'] = new_count
+            if isinstance(old_count, str) and old_count.isdigit():
+                old_count = int(old_count)
+                _DARSHAN_ROWS[date_iso]['data']['pilgrim_count'] = old_count
+
+            if new_count is None:
+                raise ValueError("pilgrim_count is None in new payload")
+
+            if date_iso in _DARSHAN_ROWS:
+                if old_count is None or old_count < new_count:
+                    _DARSHAN_ROWS[date_iso] = payload
+            else:
+                _DARSHAN_ROWS[date_iso] = payload
+
+            break
+        except KeyboardInterrupt:
+            logger.warning("Interrupted during pilgrim_count handling. Saving progress...")
+            raise
+        except Exception as e:
+            logger.warning(f"Error handling pilgrim_count for {article_id} attempt {attempt+1}: {e}")
+            try:
+                time.sleep(2)
+            except KeyboardInterrupt:
+                logger.warning("Interrupted during sleep. Saving progress...")
+                raise
+    else:
+        logger.error(f"Skipping record {article_id} after repeated pilgrim_count errors.")
+        failed_records.append(row)
+
+# ---------------------------
+# Output
+# ---------------------------
 def finalize_output(out_path: Path = Path("darshan_data.json")) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(_DARSHAN_ROWS, f, ensure_ascii=False, indent=2)
-    logging.info(f"Saved {len(_DARSHAN_ROWS)} Darshan records to {out_path}")
+    print(f"Saved {len(_DARSHAN_ROWS)} Darshan records to {out_path}")
+
+def save_failed_records() -> None:
+    if not failed_records:
+        return
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = Path(f"failed_records_{timestamp}.csv")
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=failed_records[0].keys())
+        writer.writeheader()
+        writer.writerows(failed_records)
+    logger.info(f"Saved {len(failed_records)} failed records to {out_path}")
 
 # ---------------------------
-# Main entry
+# Main
 # ---------------------------
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("data_dir", type=str)
-    parser.add_argument("--batch-size", type=int, default=10, help="Number of rows per GPT request")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
-    logging.info(f"Processing directory: {data_dir}")
+    csv_files = list(data_dir.glob("*.csv"))
+    logger.info(f"Found {len(csv_files)} CSV files in {data_dir}")
 
-    for csv_file in data_dir.glob("*.csv"):
-        logging.info(f"Reading file: {csv_file}")
-        with open(csv_file, encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            batch = []
-            for row in reader:
-                batch.append({
-                    "title": row.get("title", ""),
-                    "content": row.get("content", ""),
-                    "article_id": row.get("article_id", ""),
-                    "link": row.get("link", ""),
-                    "year": row.get("year", ""),
-                    "month": row.get("month", "")
-                })
-                if len(batch) >= args.batch_size:
-                    logging.info(f"Classifying batch of {len(batch)} rows from {csv_file.name}")
-                    process_records(batch)
-                    batch = []
-            # Process remaining rows
-            if batch:
-                logging.info(f"Classifying final batch of {len(batch)} rows from {csv_file.name}")
-                process_records(batch)
+    try:
+        for csv_file in csv_files:
+            logger.info(f"Processing file: {csv_file}")
+            stem_parts = csv_file.stem.split("_")
+            if len(stem_parts) >= 3:
+                year, month = stem_parts[1], stem_parts[2]
+            else:
+                logger.error(f"Filename format unexpected: {csv_file.name}")
+                continue
 
-    finalize_output()
+            with open(csv_file, encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in tqdm(reader):
+                    process_record(row, year, month)
+
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user. Saving progress before exit...")
+    except Exception as e:
+        logger.error(f"Fatal error occurred: {e}", exc_info=True)
+    finally:
+        finalize_output()
+        with open("article_ids.pkl", "wb") as fp:
+            pickle.dump(article_ids, fp)
+        save_failed_records()
+        logger.info("Progress saved. Exiting.")
 
 if __name__ == "__main__":
     main()
