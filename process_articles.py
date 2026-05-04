@@ -82,6 +82,7 @@ class BatchProcessor:
         provider: Optional[Any] = None,
         batch_size: int = 75,
         max_retries: int = 3,
+        state_path: Optional[Path] = None,
     ) -> None:
         if batch_size < 1 or batch_size > 10_000:
             raise ValueError("batch_size must be between 1 and 10_000")
@@ -89,13 +90,19 @@ class BatchProcessor:
         self.provider = provider or get_provider()
         self.batch_size = batch_size
         self.max_retries = max_retries
-        
-        # Create output directory with timestamp
+
+        # Create default output directory with timestamp
         self.output_dir = Path("output") / f"run_{_RUN_TIMESTAMP}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Set state_path to use new output directory
-        self.state_path = self.output_dir / "darshan_state.json"
+
+        # Allow caller to override where state is written; if provided,
+        # treat the parent directory of the state file as the output dir
+        # so subsequent outputs land alongside it.
+        if state_path is not None:
+            self.state_path = Path(state_path)
+            self.output_dir = self.state_path.parent
+        else:
+            self.state_path = self.output_dir / "darshan_state.json"
 
         # Article storage and indexing
         self.processed_articles: Dict[str, Dict[str, Any]] = {}
@@ -631,6 +638,43 @@ class BatchProcessor:
         except Exception as exc:
             logger.error("Failed to save state to %s: %s", self.state_path, exc)
 
+    def load_state(self, state_path: Path) -> None:
+        """Load a previously saved ProcessorState from disk.
+
+        This is used to resume or extend an earlier run. Existing in-memory
+        darshan_rows, failed_records, metrics, and pending_batches are
+        overwritten with the loaded values.
+        """
+
+        if not state_path.exists():
+            logger.error("State file not found: %s", state_path)
+            return
+
+        try:
+            with state_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            state = ProcessorState(**data)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to load state from %s: %s", state_path, exc)
+            return
+
+        self.darshan_rows = state.darshan_rows
+        self.failed_records = state.failed_records
+        self.metrics = state.metrics
+        self.pending_batches = state.pending_batches
+
+        # Make future saves/outputs land next to this state file.
+        self.state_path = state_path
+        self.output_dir = state_path.parent
+
+        logger.info(
+            "Loaded state from %s: %d records, %d failed, %d unique dates",
+            state_path,
+            len(self.darshan_rows),
+            len(self.failed_records),
+            self.metrics.get("final_records", len(self.darshan_rows)),
+        )
+
     def save_outputs(self) -> None:
         """Save darshan_data.json and failed_records_*.csv."""
 
@@ -722,7 +766,20 @@ def main() -> None:
         "--state-file",
         type=str,
         default=None,
-        help="Optional path for saving incremental processing state (defaults to output/run_TIMESTAMP/darshan_state.json)",
+        help=(
+            "Optional path for saving incremental processing state "
+            "(defaults to output/run_TIMESTAMP/darshan_state.json)"
+        ),
+    )
+    parser.add_argument(
+        "--resume-from-state",
+        type=str,
+        default=None,
+        help=(
+            "Path to an existing darshan_state.json file to resume/extend "
+            "a previous run (darshan_rows, failed_records, and metrics "
+            "will be loaded before processing new data)."
+        ),
     )
 
     args = parser.parse_args()
@@ -744,6 +801,7 @@ def main() -> None:
     processor = BatchProcessor(
         batch_size=args.batch_size,
         max_retries=args.max_retries,
+        state_path=Path(args.state_file) if args.state_file else None,
     )
 
     # Optional: load retry-failed CSV first
@@ -753,6 +811,14 @@ def main() -> None:
             processor.load_retry_failed(retry_path)
         else:
             logger.error("Retry-failed CSV not found: %s", retry_path)
+
+    # Optional: resume from an existing state file (e.g. from a previous run)
+    if args.resume_from_state:
+        resume_path = Path(args.resume_from_state)
+        if resume_path.exists():
+            processor.load_state(resume_path)
+        else:
+            logger.error("State file to resume from not found: %s", resume_path)
 
     try:
         # Phase 1: Load all articles

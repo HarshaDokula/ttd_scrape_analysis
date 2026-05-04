@@ -161,7 +161,14 @@ class OpenAIProvider(BaseProvider):
                     logger.error("Giving up on submitting %s batch: %s", kind, exc)
                     raise
 
-                delay = self._backoff_delay(base_delay, backoff_factor, attempt, jitter)
+                # Prefer server-provided Retry-After (for 429) when available,
+                # otherwise fall back to exponential backoff with jitter.
+                retry_delay = self._retry_delay_from_exc(exc)
+                if retry_delay is not None:
+                    delay = retry_delay
+                else:
+                    delay = self._backoff_delay(base_delay, backoff_factor, attempt, jitter)
+
                 logger.warning(
                     "Transient error submitting %s batch (%s). Retrying in %.1fs",
                     kind,
@@ -214,9 +221,16 @@ class OpenAIProvider(BaseProvider):
                     )
                     raise
 
-                delay = self._backoff_delay(
-                    base_delay, backoff_factor, error_retries, jitter
-                )
+                # Prefer server-provided Retry-After (for 429) when available,
+                # otherwise fall back to exponential backoff with jitter.
+                retry_delay = self._retry_delay_from_exc(exc)
+                if retry_delay is not None:
+                    delay = retry_delay
+                else:
+                    delay = self._backoff_delay(
+                        base_delay, backoff_factor, error_retries, jitter
+                    )
+
                 logger.warning(
                     "Transient polling error for batch %s: %s. Sleeping %.1fs before retry",
                     batch_id,
@@ -336,6 +350,31 @@ class OpenAIProvider(BaseProvider):
     def _backoff_delay(base: float, factor: float, attempt: int, jitter: float) -> float:
         delay = base * (factor ** max(0, attempt - 1))
         return delay + random.uniform(0, jitter)
+
+    @staticmethod
+    def _retry_delay_from_exc(exc: Exception) -> Optional[float]:
+        """Return server-specified retry delay (seconds) for rate limits, if any.
+
+        For 429 responses, OpenAI may include a Retry-After header indicating how
+        long the client should wait before retrying. When present and parseable,
+        we prefer that over our own backoff schedule.
+        """
+
+        if isinstance(exc, APIError):
+            status = getattr(exc, "http_status", None)
+            if status == 429:
+                headers = getattr(exc, "headers", None) or {}
+                retry_after = (
+                    headers.get("Retry-After")
+                    or headers.get("retry-after")
+                )
+                if retry_after is not None:
+                    try:
+                        return float(retry_after)
+                    except (TypeError, ValueError):
+                        # Fall back to exponential backoff when header is malformed.
+                        return None
+        return None
 
     @staticmethod
     def _should_retry(exc: Exception) -> bool:
