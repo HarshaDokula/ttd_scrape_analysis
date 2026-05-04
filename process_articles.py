@@ -1,29 +1,36 @@
 import argparse
 import csv
 import json
-from pathlib import Path
-from datetime import datetime
 import logging
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
 
-from tqdm import tqdm
 from dotenv import load_dotenv
+from tqdm import tqdm
+
+from provider_factory import get_provider
 
 load_dotenv()
 
-from provider_factory import get_provider
 
 # ---------------------------
 # Logging Setup
 # ---------------------------
 
 
+_RUN_TIMESTAMP: str = ""
+
+
 def setup_logger() -> logging.Logger:
+    global _RUN_TIMESTAMP
     logs_path = Path("logs")
     logs_path.mkdir(parents=True, exist_ok=True)
-    log_filename = logs_path / f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    _RUN_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = logs_path / f"log_{_RUN_TIMESTAMP}.log"
 
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -38,16 +45,24 @@ def setup_logger() -> logging.Logger:
 
 logger = setup_logger()
 
+
 # ---------------------------
-# Global State
+# State Dataclass
 # ---------------------------
 
-provider = get_provider()
-_DARSHAN_ROWS: Dict[str, Dict[str, Any]] = {}
-failed_records: List[Dict[str, str]] = []
-processed_articles: Dict[str, Dict[str, Any]] = {}  # Track all loaded articles
-MAX_BATCH_SIZE = 100
-MAX_RETRIES = 3
+
+@dataclass
+class ProcessorState:
+    """Serializable snapshot of processor state for persistence.
+
+    This is intentionally JSON-serializable only: dicts, lists, ints, strs.
+    """
+
+    darshan_rows: Dict[str, Dict[str, Any]]
+    failed_records: List[Dict[str, Any]]
+    metrics: Dict[str, int]
+    pending_batches: List[Dict[str, Any]]
+
 
 # ---------------------------
 # Batch Processor
@@ -55,13 +70,46 @@ MAX_RETRIES = 3
 
 
 class BatchProcessor:
-    """Process TTD articles using OpenAI Batch API."""
+    """Process TTD articles using the OpenAI Batch API.
 
-    def __init__(self):
-        self.provider = provider
-        self.classify_batches = []
-        self.extract_batches = []
-        self.metrics = {
+    This class encapsulates all mutable state required for a run so we avoid
+    module-level globals and can persist progress across batches.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: Optional[Any] = None,
+        batch_size: int = 75,
+        max_retries: int = 3,
+    ) -> None:
+        if batch_size < 1 or batch_size > 10_000:
+            raise ValueError("batch_size must be between 1 and 10_000")
+
+        self.provider = provider or get_provider()
+        self.batch_size = batch_size
+        self.max_retries = max_retries
+        
+        # Create output directory with timestamp
+        self.output_dir = Path("output") / f"run_{_RUN_TIMESTAMP}"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Set state_path to use new output directory
+        self.state_path = self.output_dir / "darshan_state.json"
+
+        # Article storage and indexing
+        self.processed_articles: Dict[str, Dict[str, Any]] = {}
+        self.article_index: Dict[str, str] = {}  # article_id -> composite key
+
+        # Outputs
+        self.darshan_rows: Dict[str, Dict[str, Any]] = {}
+        self.failed_records: List[Dict[str, Any]] = []
+
+        # Batch bookkeeping (for logging/persistence)
+        self.pending_batches: List[Dict[str, Any]] = []
+
+        # Metrics
+        self.metrics: Dict[str, int] = {
             "total_loaded": 0,
             "classified_true": 0,
             "classified_false": 0,
@@ -71,60 +119,132 @@ class BatchProcessor:
             "final_records": 0,
         }
 
+    # -----------------------
+    # Data Loading & Caching
+    # -----------------------
+
+    def _add_article(
+        self,
+        *,
+        year: str,
+        month: str,
+        row: Dict[str, Any],
+        retry: bool = False,
+    ) -> None:
+        """Add a single article row into the in-memory index.
+
+        Deduplicates by article_id: first-seen article wins. For retry rows we
+        still respect this rule but tag the stored article as a retry source.
+        """
+
+        article_id = (row.get("article_id") or "").strip()
+        title = (row.get("title") or "").strip()
+        content = (row.get("content") or "").strip()
+        link = (row.get("link") or "").strip()
+
+        if not article_id or not content:
+            return
+
+        if article_id in self.article_index:
+            # Deduplicate by article_id as per spec
+            logger.debug("Skipping duplicate article_id %s", article_id)
+            return
+
+        key = f"{year}_{month}_{article_id}"
+        self.article_index[article_id] = key
+        self.processed_articles[key] = {
+            "year": year,
+            "month": month,
+            "article_id": article_id,
+            "title": title,
+            "content": content,
+            "link": link,
+            "row": row,
+            "retry": retry,
+        }
+        self.metrics["total_loaded"] += 1
+
+    def load_retry_failed(self, csv_path: Path) -> None:
+        """Load rows from a previous failed_records_*.csv for retry.
+
+        The failed CSV retains original headers, including year/month, which
+        we use instead of deriving from the filename.
+        """
+
+        if not csv_path.exists():
+            logger.error("Retry-failed CSV not found: %s", csv_path)
+            return
+
+        logger.info("Loading retry-failed CSV: %s", csv_path)
+        with csv_path.open(encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                year = str(row.get("year") or "").strip()
+                month = str(row.get("month") or "").strip()
+                if not year or not month:
+                    logger.warning("Retry row missing year/month: %s", row)
+                    continue
+                self._add_article(year=year, month=month, row=row, retry=True)
+
     def load_articles_from_csv(self, data_dir: Path) -> None:
         """Load all articles from CSV files and store by date/article_id."""
-        global processed_articles
-        csv_files = list(data_dir.glob("*.csv"))
-        logger.info(f"Found {len(csv_files)} CSV files in {data_dir}")
+
+        csv_files = sorted(data_dir.glob("*.csv"))
+        logger.info("Found %d CSV files in %s", len(csv_files), data_dir)
 
         for csv_file in csv_files:
-            logger.info(f"Loading file: {csv_file}")
+            logger.info("Loading file: %s", csv_file)
             stem_parts = csv_file.stem.split("_")
             if len(stem_parts) < 3:
-                logger.error(f"Filename format unexpected: {csv_file.name}")
+                logger.error("Filename format unexpected: %s", csv_file.name)
                 continue
 
             year, month = stem_parts[1], stem_parts[2]
 
-            with open(csv_file, encoding="utf-8") as f:
+            with csv_file.open(encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    article_id = (row.get("article_id") or "").strip()
-                    title = (row.get("title") or "").strip()
-                    content = (row.get("content") or "").strip()
-                    link = row.get("link", "").strip()
+                    self._add_article(year=year, month=month, row=row, retry=False)
 
-                    if not article_id or not content:
-                        continue
+        logger.info("Loaded %d articles for processing", self.metrics["total_loaded"])
 
-                    key = f"{year}_{month}_{article_id}"
-                    processed_articles[key] = {
-                        "year": year,
-                        "month": month,
-                        "article_id": article_id,
-                        "title": title,
-                        "content": content,
-                        "link": link,
-                        "row": row,  # Keep original row for failed records
-                    }
-                    self.metrics["total_loaded"] += 1
+    # -----------------------
+    # Batch Helpers
+    # -----------------------
 
-        logger.info(
-            f"Loaded {self.metrics['total_loaded']} articles for processing"
-        )
+    @staticmethod
+    def _chunk(iterable: Iterable[Any], size: int) -> Iterable[List[Any]]:
+        """Yield consecutive chunks of at most `size` items from iterable."""
+
+        batch: List[Any] = []
+        for item in iterable:
+            batch.append(item)
+            if len(batch) >= size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    # -----------------------
+    # Classification Workflow
+    # -----------------------
 
     def submit_classification_batches(self) -> List[str]:
-        """Submit articles for classification in batches."""
-        articles_list = list(processed_articles.values())
-        batch_ids = []
+        """Submit all loaded articles for classification in batches."""
 
-        logger.info(f"Phase 1: Submitting {len(articles_list)} articles for classification")
+        articles_list = list(self.processed_articles.values())
+        batch_ids: List[str] = []
 
-        for i in range(0, len(articles_list), MAX_BATCH_SIZE):
-            batch = articles_list[i : i + MAX_BATCH_SIZE]
-            batch_articles = [
+        logger.info(
+            "Phase 1: Submitting %d articles for classification (batch_size=%d)",
+            len(articles_list),
+            self.batch_size,
+        )
+
+        for batch in self._chunk(articles_list, self.batch_size):
+            items = [
                 {
-                    "id": art["article_id"],
+                    "article_id": art["article_id"],
                     "title": art["title"],
                     "content": art["content"],
                 }
@@ -132,307 +252,438 @@ class BatchProcessor:
             ]
 
             try:
-                batch_id = self.provider.submit_classify_batch(batch_articles)
-                batch_ids.append(batch_id)
-                logger.info(
-                    f"Submitted classification batch {len(batch_ids)}: {batch_id} "
-                    f"({len(batch)} articles)"
+                requests_jsonl = self.provider.build_batch_requests(
+                    "classification", items
                 )
-            except Exception as e:
-                logger.error(f"Error submitting classification batch: {e}")
-                # Add all articles in this batch to failed records
+                batch_id = self.provider.submit_batch(
+                    "classification",
+                    requests_jsonl,
+                    max_retries=self.max_retries,
+                )
+                batch_ids.append(batch_id)
+                self.pending_batches.append(
+                    {
+                        "kind": "classification",
+                        "batch_id": batch_id,
+                        "article_ids": [a["article_id"] for a in batch],
+                    }
+                )
+                logger.info(
+                    "Submitted classification batch %d: %s (%d articles)",
+                    len(batch_ids),
+                    batch_id,
+                    len(batch),
+                )
+            except Exception as exc:  # network/API errors; logged + mark failed
+                logger.error("Error submitting classification batch: %s", exc)
                 for art in batch:
-                    failed_records.append(art["row"])
+                    self.failed_records.append(art["row"])
 
         return batch_ids
 
     def process_classification_results(self, batch_ids: List[str]) -> List[str]:
-        """Poll and process classification batch results."""
-        logger.info(f"Phase 1b: Polling {len(batch_ids)} classification batches")
+        """Poll and process classification batch results.
 
-        extract_article_ids = []
+        Returns a list of article_ids that were classified as TRUE and should
+        be forwarded to extraction.
+        """
+
+        logger.info(
+            "Phase 1b: Polling %d classification batches", len(batch_ids)
+        )
+
+        extract_article_ids: List[str] = []
 
         for batch_id in batch_ids:
             try:
-                status = self.provider.poll_batch_status(batch_id)
+                status = self.provider.poll_batch_status(
+                    batch_id, max_retries=self.max_retries
+                )
                 logger.info(
-                    f"Classification batch {batch_id}: status={status['status']} "
-                    f"(processed={status['processed']}, failed={status['failed']})"
+                    "Classification batch %s: status=%s (processed=%s, failed=%s)",
+                    batch_id,
+                    status["status"],
+                    status["processed"],
+                    status["failed"],
                 )
 
                 if status["status"] != "completed":
-                    logger.warning(f"Batch {batch_id} did not complete successfully")
+                    logger.warning(
+                        "Classification batch %s did not complete successfully", batch_id
+                    )
                     continue
 
                 results = self.provider.get_batch_results(batch_id)
 
                 for result in results:
                     custom_id = result.get("custom_id", "")
-                    if not custom_id.endswith("-classify"):
+                    if not custom_id.endswith("-classification") and not custom_id.endswith(
+                        "-classify"
+                    ):
                         continue
 
-                    article_id = custom_id.replace("-classify", "")
-                    response_text = self.provider.parse_response(result)
+                    # Support both {id}-classify and {id}-classification custom IDs.
+                    if custom_id.endswith("-classification"):
+                        article_id = custom_id[: -len("-classification")]
+                    else:
+                        article_id = custom_id[: -len("-classify")]
 
-                    if response_text and response_text.lower() == "true":
+                    label = self.provider.parse_response(
+                        result, kind="classification"
+                    )
+
+                    if label is None:
+                        logger.warning(
+                            "No classification response for article %s", article_id
+                        )
+                        self._record_failure_by_article_id(article_id)
+                        continue
+
+                    if str(label).strip().lower() == "true":
                         self.metrics["classified_true"] += 1
                         extract_article_ids.append(article_id)
-                        logger.debug(f"Article {article_id}: classified as TRUE")
+                        logger.debug("Article %s: classified as TRUE", article_id)
                     else:
                         self.metrics["classified_false"] += 1
-                        logger.debug(f"Article {article_id}: classified as FALSE")
+                        logger.debug("Article %s: classified as FALSE", article_id)
 
-            except Exception as e:
-                logger.error(f"Error processing classification batch {batch_id}: {e}")
+                # Retrieve and log batch-level errors, if any
+                errors = self.provider.get_batch_errors(batch_id)
+                for error in errors:
+                    logger.error("Classification batch %s error: %s", batch_id, error)
+
+            except Exception as exc:
+                logger.error(
+                    "Error processing classification batch %s: %s", batch_id, exc
+                )
 
         logger.info(
-            f"Classification complete: {self.metrics['classified_true']} true, "
-            f"{self.metrics['classified_false']} false"
+            "Classification complete: %d true, %d false",
+            self.metrics["classified_true"],
+            self.metrics["classified_false"],
         )
         return extract_article_ids
 
-    def submit_extraction_batches(
-        self, article_ids: List[str]
-    ) -> List[tuple[str, str]]:
-        """Submit classified articles for metric extraction."""
+    # -----------------------
+    # Extraction Workflow
+    # -----------------------
+
+    def submit_extraction_batches(self, article_ids: List[str]) -> List[str]:
+        """Submit classified-TRUE articles for metric extraction."""
+
         logger.info(
-            f"Phase 2: Submitting {len(article_ids)} articles for metric extraction"
+            "Phase 2: Submitting %d articles for metric extraction", len(article_ids)
         )
 
-        batch_ids = []
+        batch_ids: List[str] = []
 
-        for i in range(0, len(article_ids), MAX_BATCH_SIZE):
-            batch_ids_chunk = article_ids[i : i + MAX_BATCH_SIZE]
-            batch_articles = [
-                {
-                    "id": art_id,
-                    "content": processed_articles[
-                        next(
-                            k
-                            for k in processed_articles.keys()
-                            if k.endswith(f"_{art_id}")
-                        )
-                    ]["content"],
-                }
-                for art_id in batch_ids_chunk
-            ]
+        for id_batch in self._chunk(article_ids, self.batch_size):
+            batch_articles: List[Dict[str, Any]] = []
+            for article_id in id_batch:
+                key = self.article_index.get(article_id)
+                if not key:
+                    logger.warning(
+                        "Article %s not found in cache when building extraction batch",
+                        article_id,
+                    )
+                    continue
+                article = self.processed_articles[key]
+                batch_articles.append(
+                    {
+                        "article_id": article_id,
+                        "content": article["content"],
+                    }
+                )
+
+            if not batch_articles:
+                continue
 
             try:
-                batch_id = self.provider.submit_extract_batch(batch_articles)
-                batch_ids.append((batch_id, ",".join(batch_ids_chunk)))
-                logger.info(
-                    f"Submitted extraction batch {len(batch_ids)}: {batch_id} "
-                    f"({len(batch_articles)} articles)"
+                requests_jsonl = self.provider.build_batch_requests(
+                    "extraction", batch_articles
                 )
-            except Exception as e:
-                logger.error(f"Error submitting extraction batch: {e}")
+                batch_id = self.provider.submit_batch(
+                    "extraction",
+                    requests_jsonl,
+                    max_retries=self.max_retries,
+                )
+                batch_ids.append(batch_id)
+                self.pending_batches.append(
+                    {
+                        "kind": "extraction",
+                        "batch_id": batch_id,
+                        "article_ids": id_batch,
+                    }
+                )
+                logger.info(
+                    "Submitted extraction batch %d: %s (%d articles)",
+                    len(batch_ids),
+                    batch_id,
+                    len(batch_articles),
+                )
+            except Exception as exc:
+                logger.error("Error submitting extraction batch: %s", exc)
 
         return batch_ids
 
-    def process_extraction_results(
-        self, batch_id_pairs: List[tuple[str, str]]
-    ) -> None:
-        """Poll and process extraction batch results."""
-        logger.info(f"Phase 2b: Polling {len(batch_id_pairs)} extraction batches")
+    def process_extraction_results(self, batch_ids: List[str]) -> None:
+        """Poll and process extraction batch results, updating darshan_rows."""
 
-        for batch_id, article_ids_str in batch_id_pairs:
+        logger.info(
+            "Phase 2b: Polling %d extraction batches", len(batch_ids)
+        )
+
+        for batch_id in batch_ids:
             try:
-                status = self.provider.poll_batch_status(batch_id)
+                status = self.provider.poll_batch_status(
+                    batch_id, max_retries=self.max_retries
+                )
                 logger.info(
-                    f"Extraction batch {batch_id}: status={status['status']} "
-                    f"(processed={status['processed']}, failed={status['failed']})"
+                    "Extraction batch %s: status=%s (processed=%s, failed=%s)",
+                    batch_id,
+                    status["status"],
+                    status["processed"],
+                    status["failed"],
                 )
 
                 if status["status"] != "completed":
-                    logger.warning(f"Batch {batch_id} did not complete successfully")
+                    logger.warning(
+                        "Extraction batch %s did not complete successfully", batch_id
+                    )
                     continue
 
                 results = self.provider.get_batch_results(batch_id)
 
                 for result in results:
                     custom_id = result.get("custom_id", "")
-                    if not custom_id.endswith("-extract"):
+                    if not custom_id.endswith("-extraction") and not custom_id.endswith(
+                        "-extract"
+                    ):
                         continue
 
-                    article_id = custom_id.replace("-extract", "")
-                    response_text = self.provider.parse_response(result)
+                    if custom_id.endswith("-extraction"):
+                        article_id = custom_id[: -len("-extraction")]
+                    else:
+                        article_id = custom_id[: -len("-extract")]
 
-                    # Find the article in processed_articles
-                    article_key = next(
-                        (k for k in processed_articles.keys() if k.endswith(f"_{article_id}")),
-                        None,
-                    )
-                    if not article_key:
-                        logger.warning(f"Article {article_id} not found in cache")
-                        continue
-
-                    article = processed_articles[article_key]
-                    year = article["year"]
-                    month = article["month"]
-
-                    # Parse JSON response
-                    if not response_text:
-                        logger.warning(f"No response for article {article_id}")
-                        failed_records.append(article["row"])
-                        self.metrics["extracted_failed"] += 1
-                        continue
-
-                    data = self._extract_json(response_text)
-                    if not data:
-                        logger.warning(f"Failed to parse JSON for article {article_id}")
-                        failed_records.append(article["row"])
-                        self.metrics["extracted_failed"] += 1
-                        continue
-
-                    # Extract day and pilgrim_count
-                    try:
-                        day = data.get("day")
-                        if day is None or day == 0:
-                            logger.warning(
-                                f"Article {article_id}: invalid day={day}, skipping"
-                            )
-                            failed_records.append(article["row"])
-                            self.metrics["invalid_date"] += 1
-                            continue
-
-                        date_iso = f"{year}-{month.zfill(2)}-{str(day).zfill(2)}"
-
-                        pilgrim_count = data.get("pilgrim_count")
-                        if pilgrim_count is None:
-                            logger.warning(
-                                f"Article {article_id}: no pilgrim_count, skipping"
-                            )
-                            failed_records.append(article["row"])
-                            self.metrics["extracted_failed"] += 1
-                            continue
-
-                        # Convert string counts to int
-                        if isinstance(pilgrim_count, str):
-                            pilgrim_count = int(pilgrim_count)
-
-                        payload = {
-                            "article_id": article_id,
-                            "title": article["title"],
-                            "post": article["link"],
-                            "data": {
-                                "pilgrim_count": pilgrim_count,
-                                "other_metrics": data.get("other_metrics", {}),
-                            },
-                        }
-
-                        # Store or update (keep highest count per date)
-                        if date_iso in _DARSHAN_ROWS:
-                            existing_count = _DARSHAN_ROWS[date_iso]["data"].get(
-                                "pilgrim_count", 0
-                            )
-                            if pilgrim_count > existing_count:
-                                _DARSHAN_ROWS[date_iso] = payload
-                        else:
-                            _DARSHAN_ROWS[date_iso] = payload
-
-                        self.metrics["extracted_success"] += 1
-                        logger.debug(
-                            f"Article {article_id}: extracted count={pilgrim_count} for {date_iso}"
+                    data = self.provider.parse_response(result, kind="extraction")
+                    if data is None:
+                        logger.warning(
+                            "No extraction JSON for article %s", article_id
                         )
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing extraction for {article_id}: {e}"
-                        )
-                        failed_records.append(article["row"])
+                        self._record_failure_by_article_id(article_id)
                         self.metrics["extracted_failed"] += 1
+                        continue
 
-            except Exception as e:
-                logger.error(f"Error processing extraction batch {batch_id}: {e}")
+                    # Validate schema
+                    if not isinstance(data, dict):
+                        logger.warning(
+                            "Extraction for article %s returned non-dict payload: %r",
+                            article_id,
+                            data,
+                        )
+                        self._record_failure_by_article_id(article_id)
+                        self.metrics["extracted_failed"] += 1
+                        continue
 
-        self.metrics["final_records"] = len(_DARSHAN_ROWS)
+                    self._apply_extraction_result(article_id, data)
+
+                # After each completed extraction batch, persist state
+                self.save_state()
+
+            except Exception as exc:
+                logger.error(
+                    "Error processing extraction batch %s: %s", batch_id, exc
+                )
+
+        self.metrics["final_records"] = len(self.darshan_rows)
         logger.info(
-            f"Extraction complete: {self.metrics['extracted_success']} success, "
-            f"{self.metrics['extracted_failed']} failed, "
-            f"{self.metrics['final_records']} unique dates"
+            "Extraction complete: %d success, %d failed, %d unique dates",
+            self.metrics["extracted_success"],
+            self.metrics["extracted_failed"],
+            self.metrics["final_records"],
         )
 
-    @staticmethod
-    def _extract_json(text: str) -> Optional[Dict[str, Any]]:
-        """Extract and parse JSON from text."""
-        try:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start == -1 or end == 0:
-                return None
+    # -----------------------
+    # Extraction Helpers
+    # -----------------------
 
-            json_str = text[start:end]
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parse error: {e}")
-            return None
+    def _record_failure_by_article_id(self, article_id: str) -> None:
+        key = self.article_index.get(article_id)
+        if not key:
+            return
+        article = self.processed_articles.get(key)
+        if not article:
+            return
+        self.failed_records.append(article["row"])
+
+    def _apply_extraction_result(self, article_id: str, data: Dict[str, Any]) -> None:
+        """Validate and apply a single extraction JSON payload."""
+
+        key = self.article_index.get(article_id)
+        if not key:
+            logger.warning("Article %s not found in cache", article_id)
+            return
+
+        article = self.processed_articles[key]
+        year = str(article["year"])
+        month = str(article["month"]).zfill(2)
+
+        try:
+            day = data.get("day")
+            if not isinstance(day, int) or not (1 <= day <= 31):
+                logger.warning(
+                    "Article %s: invalid day %r, treating as failure", article_id, day
+                )
+                self.failed_records.append(article["row"])
+                self.metrics["invalid_date"] += 1
+                return
+
+            date_iso = f"{year}-{month}-{str(day).zfill(2)}"
+
+            pilgrim_count = data.get("pilgrim_count")
+            if pilgrim_count is None:
+                logger.warning(
+                    "Article %s: missing pilgrim_count, treating as failure",
+                    article_id,
+                )
+                self.failed_records.append(article["row"])
+                self.metrics["extracted_failed"] += 1
+                return
+
+            if isinstance(pilgrim_count, str):
+                try:
+                    pilgrim_count = int(pilgrim_count.replace(",", ""))
+                except ValueError:
+                    logger.warning(
+                        "Article %s: non-numeric pilgrim_count %r", article_id, pilgrim_count
+                    )
+                    self.failed_records.append(article["row"])
+                    self.metrics["extracted_failed"] += 1
+                    return
+
+            if not isinstance(pilgrim_count, int) or pilgrim_count < 0:
+                logger.warning(
+                    "Article %s: invalid pilgrim_count %r", article_id, pilgrim_count
+                )
+                self.failed_records.append(article["row"])
+                self.metrics["extracted_failed"] += 1
+                return
+
+            other_metrics = data.get("other_metrics") or {}
+            if not isinstance(other_metrics, dict):
+                other_metrics = {}
+
+            payload = {
+                "article_id": article_id,
+                "title": article["title"],
+                "post": article["link"],
+                "data": {
+                    "pilgrim_count": pilgrim_count,
+                    "other_metrics": other_metrics,
+                },
+            }
+
+            # Keep highest pilgrim_count per date
+            if date_iso in self.darshan_rows:
+                existing_count = self.darshan_rows[date_iso]["data"].get(
+                    "pilgrim_count", 0
+                )
+                if pilgrim_count > existing_count:
+                    self.darshan_rows[date_iso] = payload
+            else:
+                self.darshan_rows[date_iso] = payload
+
+            self.metrics["extracted_success"] += 1
+            logger.debug(
+                "Article %s: extracted count=%d for %s",
+                article_id,
+                pilgrim_count,
+                date_iso,
+            )
+        except Exception as exc:
+            logger.error("Error applying extraction for %s: %s", article_id, exc)
+            self.failed_records.append(article["row"])
+            self.metrics["extracted_failed"] += 1
+
+    # -----------------------
+    # Persistence & Metrics
+    # -----------------------
+
+    def to_state(self) -> ProcessorState:
+        return ProcessorState(
+            darshan_rows=self.darshan_rows,
+            failed_records=self.failed_records,
+            metrics=self.metrics,
+            pending_batches=self.pending_batches,
+        )
+
+    def save_state(self) -> None:
+        """Persist current state to JSON for manual resumption/inspection."""
+
+        try:
+            state = self.to_state()
+            data = asdict(state)
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.state_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.info("Saved processor state to %s", self.state_path)
+        except Exception as exc:
+            logger.error("Failed to save state to %s: %s", self.state_path, exc)
 
     def save_outputs(self) -> None:
-        """Save processed data and failed records."""
+        """Save darshan_data.json and failed_records_*.csv."""
+
         # Save darshan_data.json
-        output_path = Path("darshan_data.json")
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(_DARSHAN_ROWS, f, ensure_ascii=False, indent=2)
-        logger.info(f"Saved {len(_DARSHAN_ROWS)} Darshan records to {output_path}")
+        output_path = self.output_dir / "darshan_data.json"
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(self.darshan_rows, f, ensure_ascii=False, indent=2)
+        logger.info(
+            "Saved %d Darshan records to %s",
+            len(self.darshan_rows),
+            output_path,
+        )
 
         # Save failed records
-        if failed_records:
+        if self.failed_records:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            failed_path = Path(f"failed_records_{timestamp}.csv")
-            with open(failed_path, "w", newline="", encoding="utf-8") as f:
-                if failed_records:
-                    fieldnames = failed_records[0].keys()
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(failed_records)
-            logger.info(f"Saved {len(failed_records)} failed records to {failed_path}")
+            failed_path = self.output_dir / f"failed_records_{timestamp}.csv"
+            with failed_path.open("w", newline="", encoding="utf-8") as f:
+                fieldnames = list(self.failed_records[0].keys())
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.failed_records)
+            logger.info(
+                "Saved %d failed records to %s", len(self.failed_records), failed_path
+            )
 
     def print_metrics(self) -> None:
         """Print processing metrics."""
+
         logger.info("=" * 60)
         logger.info("PROCESSING METRICS")
         logger.info("=" * 60)
-        logger.info(f"Total articles loaded:      {self.metrics['total_loaded']}")
-        logger.info(f"Classified as TRUE:         {self.metrics['classified_true']}")
-        logger.info(f"Classified as FALSE:        {self.metrics['classified_false']}")
-        logger.info(f"Successfully extracted:     {self.metrics['extracted_success']}")
-        logger.info(f"Extraction failed:          {self.metrics['extracted_failed']}")
-        logger.info(f"Invalid dates (no day):     {self.metrics['invalid_date']}")
-        logger.info(f"Final unique dates:         {self.metrics['final_records']}")
-        logger.info(f"Total failed records:       {len(failed_records)}")
+        logger.info("Total articles loaded:      %d", self.metrics["total_loaded"])
+        logger.info("Classified as TRUE:         %d", self.metrics["classified_true"])
+        logger.info("Classified as FALSE:        %d", self.metrics["classified_false"])
+        logger.info(
+            "Successfully extracted:     %d", self.metrics["extracted_success"]
+        )
+        logger.info(
+            "Extraction failed:          %d", self.metrics["extracted_failed"]
+        )
+        logger.info("Invalid dates (no day):     %d", self.metrics["invalid_date"])
+        logger.info("Final unique dates:         %d", self.metrics["final_records"])
+        logger.info("Total failed records:       %d", len(self.failed_records))
 
         if self.metrics["total_loaded"] > 0:
             success_rate = (
-                self.metrics["extracted_success"] / self.metrics["total_loaded"] * 100
+                self.metrics["extracted_success"]
+                / self.metrics["total_loaded"]
+                * 100
             )
-            logger.info(f"Overall success rate:       {success_rate:.1f}%")
+            logger.info("Overall success rate:       %.1f%%", success_rate)
         logger.info("=" * 60)
-
-
-# ---------------------------
-# Output Functions
-# ---------------------------
-
-
-def finalize_output(out_path: Path = Path("darshan_data.json")) -> None:
-    """Save darshan_data.json."""
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(_DARSHAN_ROWS, f, ensure_ascii=False, indent=2)
-    logger.info(f"Saved {len(_DARSHAN_ROWS)} Darshan records to {out_path}")
-
-
-def save_failed_records() -> None:
-    """Save failed records to CSV."""
-    if not failed_records:
-        return
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = Path(f"failed_records_{timestamp}.csv")
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        if failed_records:
-            writer = csv.DictWriter(f, fieldnames=failed_records[0].keys())
-            writer.writeheader()
-            writer.writerows(failed_records)
-    logger.info(f"Saved {len(failed_records)} failed records to {out_path}")
 
 
 # ---------------------------
@@ -440,20 +691,68 @@ def save_failed_records() -> None:
 # ---------------------------
 
 
-def main():
+def main() -> None:
     """Main entry point."""
+
     parser = argparse.ArgumentParser(
-        description="Process TTD articles using OpenAI Batch API"
+        description="Process TTD articles using OpenAI Batch API",
     )
-    parser.add_argument("data_dir", type=str, help="Directory containing CSV files")
+    parser.add_argument(
+        "data_dir", type=str, help="Directory containing CSV files",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=75,
+        help="Batch size for classification/extraction (1-10000)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="Max retries for batch submission/polling",
+    )
+    parser.add_argument(
+        "--retry-failed",
+        type=str,
+        default=None,
+        help="Optional failed_records_*.csv to retry before normal CSV ingest",
+    )
+    parser.add_argument(
+        "--state-file",
+        type=str,
+        default=None,
+        help="Optional path for saving incremental processing state (defaults to output/run_TIMESTAMP/darshan_state.json)",
+    )
+
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
     if not data_dir.exists():
-        logger.error(f"Data directory not found: {data_dir}")
+        logger.error("Data directory not found: %s", data_dir)
         sys.exit(1)
 
-    processor = BatchProcessor()
+    if args.batch_size < 1 or args.batch_size > 10_000:
+        logger.error("--batch-size must be between 1 and 10_000")
+        sys.exit(1)
+    if args.batch_size > 1000:
+        logger.warning(
+            "Batch size %d is large; OpenAI limit is 10_000 but consider smaller batches",
+            args.batch_size,
+        )
+
+    processor = BatchProcessor(
+        batch_size=args.batch_size,
+        max_retries=args.max_retries,
+    )
+
+    # Optional: load retry-failed CSV first
+    if args.retry_failed:
+        retry_path = Path(args.retry_failed)
+        if retry_path.exists():
+            processor.load_retry_failed(retry_path)
+        else:
+            logger.error("Retry-failed CSV not found: %s", retry_path)
 
     try:
         # Phase 1: Load all articles
@@ -467,33 +766,38 @@ def main():
         logger.info("PHASE 2: CLASSIFICATION")
         logger.info("=" * 60)
         classify_batch_ids = processor.submit_classification_batches()
-        classify_article_ids = processor.process_classification_results(classify_batch_ids)
+        classify_article_ids = processor.process_classification_results(
+            classify_batch_ids
+        )
 
         # Phase 3: Submit and process extraction
         logger.info("=" * 60)
         logger.info("PHASE 3: EXTRACTION")
         logger.info("=" * 60)
-        extract_batch_pairs = processor.submit_extraction_batches(classify_article_ids)
-        processor.process_extraction_results(extract_batch_pairs)
+        extract_batch_ids = processor.submit_extraction_batches(classify_article_ids)
+        processor.process_extraction_results(extract_batch_ids)
 
         # Phase 4: Save outputs
         logger.info("=" * 60)
         logger.info("PHASE 4: SAVING OUTPUTS")
         logger.info("=" * 60)
         processor.save_outputs()
+        processor.save_state()
         processor.print_metrics()
 
     except KeyboardInterrupt:
-        logger.warning("Interrupted by user. Saving progress...")
+        logger.warning("Interrupted by user. Saving progress and exiting...")
         processor.save_outputs()
+        processor.save_state()
         processor.print_metrics()
         sys.exit(1)
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Fatal error: %s", exc, exc_info=True)
         processor.save_outputs()
+        processor.save_state()
         processor.print_metrics()
         sys.exit(1)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()
