@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 import time
+import signal
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -82,14 +83,18 @@ class BatchProcessor:
         provider: Optional[Any] = None,
         batch_size: int = 75,
         max_retries: int = 3,
+        max_inflight_batches: int = 10,
         state_path: Optional[Path] = None,
     ) -> None:
         if batch_size < 1 or batch_size > 10_000:
             raise ValueError("batch_size must be between 1 and 10_000")
+        if max_inflight_batches < 1:
+            raise ValueError("max_inflight_batches must be at least 1")
 
         self.provider = provider or get_provider()
         self.batch_size = batch_size
         self.max_retries = max_retries
+        self.max_inflight_batches = max_inflight_batches
 
         # Create default output directory with timestamp
         self.output_dir = Path("output") / f"run_{_RUN_TIMESTAMP}"
@@ -232,9 +237,298 @@ class BatchProcessor:
         if batch:
             yield batch
 
+    @staticmethod
+    def _retry_delay_for_exception(
+        exc: Exception,
+        attempt: int,
+        *,
+        base_delay: float = 5.0,
+        backoff_factor: float = 2.0,
+        max_delay: float = 60.0,
+    ) -> float:
+        """Return a retry delay (seconds) for synchronous API errors.
+
+        Respects ``Retry-After`` headers when present (e.g. for HTTP 429) and
+        otherwise falls back to exponential backoff with jitter.
+        """
+
+        headers = getattr(exc, "headers", None)
+        retry_after: Optional[float] = None
+        if headers and hasattr(headers, "get"):
+            for key in ("Retry-After", "retry-after"):
+                value = headers.get(key)
+                if value is None:
+                    continue
+                try:
+                    retry_after = float(value)
+                    break
+                except (TypeError, ValueError):
+                    retry_after = None
+
+        if retry_after is not None:
+            delay = retry_after
+        else:
+            delay = base_delay * (backoff_factor ** max(0, attempt - 1))
+
+        delay = min(max_delay, delay)
+
+        try:
+            import random
+
+            jitter = delay * 0.1
+            if jitter > 0:
+                delay += random.uniform(-jitter, jitter)
+        except Exception:
+            pass
+
+        if delay < 1:
+            delay = 1
+
+        return float(delay)
+
     # -----------------------
     # Classification Workflow
     # -----------------------
+
+    def _throttle_inflight_batches(self, active_batch_ids: List[str]) -> None:
+        """Block until the number of in-flight batches is below the limit.
+
+        This is used during submission to avoid exceeding OpenAI's
+        organization-wide enqueued token limit by having too many batches
+        simultaneously in non-terminal states.
+        """
+
+        if self.max_inflight_batches <= 0:
+            return
+
+        if not active_batch_ids:
+            return
+
+        interval = getattr(self.provider, "poll_interval", 10)
+
+        while len(active_batch_ids) >= self.max_inflight_batches:
+            for batch_id in list(active_batch_ids):
+                try:
+                    status = self.provider.get_batch_status(batch_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "Error checking status for inflight batch %s: %s",
+                        batch_id,
+                        exc,
+                    )
+                    continue
+
+                state = status.get("status")
+                if state in {"completed", "failed", "expired"}:
+                    # From a submission-throttling perspective, any terminal
+                    # state frees capacity. The detailed handling for
+                    # failed/expired/timeouts happens later during result
+                    # processing.
+                    active_batch_ids.remove(batch_id)
+
+            if len(active_batch_ids) >= self.max_inflight_batches:
+                time.sleep(interval)
+
+    def _get_batch_article_ids(self, batch_id: str) -> List[str]:
+        """Return the article_ids recorded for a given batch_id, if any."""
+
+        for batch in self.pending_batches:
+            if batch.get("batch_id") == batch_id:
+                ids = batch.get("article_ids") or []
+                # Ensure we always return a new list so callers can't mutate
+                # the internal structure by accident.
+                return list(ids)
+        return []
+
+    def _mark_batch_failed(self, batch_id: str, reason: str = "") -> None:
+        """Mark all articles in the given batch as failed.
+
+        This is used when a batch ends in a non-successful terminal state
+        (failed/expired) or when we give up waiting for it due to timeout
+        or polling errors.
+        """
+
+        article_ids = self._get_batch_article_ids(batch_id)
+        if not article_ids:
+            logger.warning(
+                "No article_ids recorded for failed batch %s; nothing to mark", batch_id
+            )
+            return
+
+        if reason:
+            logger.error(
+                "Marking %d articles from batch %s as failed (%s)",
+                len(article_ids),
+                batch_id,
+                reason,
+            )
+        else:
+            logger.error(
+                "Marking %d articles from batch %s as failed", len(article_ids), batch_id
+            )
+
+        for article_id in article_ids:
+            self._record_failure_by_article_id(article_id)
+
+    def _poll_batches_round_robin(
+        self,
+        *,
+        kind: str,
+        batch_ids: List[str],
+        per_batch_timeout_sec: int = 15 * 60,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Poll multiple batches in a round-robin fashion until they settle.
+
+        This avoids getting stuck on a single long-running batch: we check the
+        status of all outstanding batch IDs once per loop iteration, sleep for
+        ``provider.poll_interval``, and repeat until each batch reaches a
+        terminal state (``completed``, ``failed``, or ``expired``) or its
+        per-batch timeout is exceeded.
+
+        Returns a mapping of ``batch_id -> status_dict`` where ``status_dict``
+        matches the shape returned by ``OpenAIProvider.get_batch_status``.
+        """
+
+        if not batch_ids:
+            return {}
+
+        outstanding = set(batch_ids)
+        statuses: Dict[str, Dict[str, Any]] = {}
+        start_times: Dict[str, float] = {bid: time.time() for bid in batch_ids}
+        # Adaptive polling interval: start at provider.poll_interval (or 10s),
+        # but enforce a minimum of 10s and exponential backoff up to 3600s (1h).
+        min_interval = max(10, getattr(self.provider, "poll_interval", 10))
+        max_interval = 3600
+        backoff_factor = 2.0
+        current_interval = float(min_interval)
+
+        # Track last processed counts to detect progress and shrink backoff.
+        last_processed: Dict[str, int] = {bid: -1 for bid in batch_ids}
+
+        pretty_kind = kind.capitalize()
+
+        while outstanding:
+            made_progress = False
+
+            for batch_id in list(outstanding):
+                try:
+                    status = self.provider.get_batch_status(batch_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "%s batch %s: polling error: %s", pretty_kind, batch_id, exc
+                    )
+                    self._mark_batch_failed(batch_id, reason="polling error")
+                    outstanding.remove(batch_id)
+                    made_progress = True
+                    continue
+
+                state = status.get("status")
+                processed = int(status.get("processed") or 0)
+
+                # Detect progress if processed count increased
+                if processed != last_processed.get(batch_id, -1):
+                    last_processed[batch_id] = processed
+                    made_progress = True
+
+                if state in {"completed", "failed", "expired"}:
+                    statuses[batch_id] = status
+                    outstanding.remove(batch_id)
+                    made_progress = True
+
+                    if state != "completed":
+                        # Fetch and log batch-level errors for non-successful batches.
+                        try:
+                            errors = self.provider.get_batch_errors(batch_id)
+                            for error in errors:
+                                logger.error(
+                                    "%s batch %s error: %s",
+                                    pretty_kind,
+                                    batch_id,
+                                    error,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error(
+                                "Failed to retrieve error file for %s batch %s: %s",
+                                kind,
+                                batch_id,
+                                exc,
+                            )
+
+                        self._mark_batch_failed(
+                            batch_id,
+                            reason=f"terminal status {state}",
+                        )
+
+                    continue
+
+                # Non-terminal state (e.g. validating/in_progress/finalizing)
+                elapsed = time.time() - start_times[batch_id]
+                if elapsed > per_batch_timeout_sec:
+                    logger.error(
+                        "%s batch %s did not reach terminal status within %d seconds; "
+                        "treating as failed",
+                        pretty_kind,
+                        batch_id,
+                        per_batch_timeout_sec,
+                    )
+                    status_with_timeout = dict(status)
+                    status_with_timeout["status"] = "timeout"
+                    statuses[batch_id] = status_with_timeout
+                    outstanding.remove(batch_id)
+                    try:
+                        errors = self.provider.get_batch_errors(batch_id)
+                        for error in errors:
+                            logger.error(
+                                "%s batch %s error (on timeout): %s",
+                                pretty_kind,
+                                batch_id,
+                                error,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "Failed to retrieve error file for %s batch %s after "
+                            "timeout: %s",
+                            kind,
+                            batch_id,
+                            exc,
+                        )
+
+                    self._mark_batch_failed(batch_id, reason="timeout")
+
+            if outstanding:
+                # Adjust polling interval: if we saw progress, reset to the
+                # minimum; otherwise, back off exponentially up to
+                # ``max_interval``. Add a small jitter so multiple workers
+                # polling the same batches do not synchronize.
+                if made_progress:
+                    current_interval = float(min_interval)
+                else:
+                    current_interval = min(
+                        max_interval,
+                        current_interval * backoff_factor,
+                    )
+
+                try:
+                    import random
+
+                    jitter = current_interval * 0.1
+                    sleep_time = current_interval + random.uniform(-jitter, jitter)
+                except Exception:
+                    sleep_time = current_interval
+
+                if sleep_time < min_interval:
+                    sleep_time = min_interval
+
+                logger.debug(
+                    "%s: %d outstanding, sleeping %.1fs (interval=%.1fs)",
+                    pretty_kind,
+                    len(outstanding),
+                    sleep_time,
+                    current_interval,
+                )
+                time.sleep(sleep_time)
+
+        return statuses
 
     def submit_classification_batches(self) -> List[str]:
         """Submit all loaded articles for classification in batches."""
@@ -243,10 +537,13 @@ class BatchProcessor:
         batch_ids: List[str] = []
 
         logger.info(
-            "Phase 1: Submitting %d articles for classification (batch_size=%d)",
+            "Phase 1: Submitting %d articles for classification (batch_size=%d, max_inflight_batches=%d)",
             len(articles_list),
             self.batch_size,
+            self.max_inflight_batches,
         )
+
+        active_batches: List[str] = []
 
         for batch in self._chunk(articles_list, self.batch_size):
             items = [
@@ -268,6 +565,7 @@ class BatchProcessor:
                     max_retries=self.max_retries,
                 )
                 batch_ids.append(batch_id)
+                active_batches.append(batch_id)
                 self.pending_batches.append(
                     {
                         "kind": "classification",
@@ -281,6 +579,11 @@ class BatchProcessor:
                     batch_id,
                     len(batch),
                 )
+
+                # Throttle submissions so we don't accumulate too many batches
+                # in non-terminal states and hit the enqueued token limit.
+                self._throttle_inflight_batches(active_batches)
+
             except Exception as exc:  # network/API errors; logged + mark failed
                 logger.error("Error submitting classification batch: %s", exc)
                 for art in batch:
@@ -301,25 +604,26 @@ class BatchProcessor:
 
         extract_article_ids: List[str] = []
 
-        for batch_id in batch_ids:
-            try:
-                status = self.provider.poll_batch_status(
-                    batch_id, max_retries=self.max_retries
-                )
-                logger.info(
-                    "Classification batch %s: status=%s (processed=%s, failed=%s)",
+        # Use round-robin polling so that a single slow or stuck batch cannot
+        # block progress on all other batches.
+        statuses = self._poll_batches_round_robin(
+            kind="classification",
+            batch_ids=batch_ids,
+            per_batch_timeout_sec=15 * 60,
+        )
+
+        for batch_id, status in statuses.items():
+            if status.get("status") != "completed":
+                # Non-successful batches have already had their articles marked
+                # as failed in _poll_batches_round_robin.
+                logger.warning(
+                    "Classification batch %s ended with status=%s; skipping results",
                     batch_id,
-                    status["status"],
-                    status["processed"],
-                    status["failed"],
+                    status.get("status"),
                 )
+                continue
 
-                if status["status"] != "completed":
-                    logger.warning(
-                        "Classification batch %s did not complete successfully", batch_id
-                    )
-                    continue
-
+            try:
                 results = self.provider.get_batch_results(batch_id)
 
                 for result in results:
@@ -354,7 +658,7 @@ class BatchProcessor:
                         self.metrics["classified_false"] += 1
                         logger.debug("Article %s: classified as FALSE", article_id)
 
-                # Retrieve and log batch-level errors, if any
+                # Retrieve and log batch-level errors for successful batches as well
                 errors = self.provider.get_batch_errors(batch_id)
                 for error in errors:
                     logger.error("Classification batch %s error: %s", batch_id, error)
@@ -383,6 +687,7 @@ class BatchProcessor:
         )
 
         batch_ids: List[str] = []
+        active_batches: List[str] = []
 
         for id_batch in self._chunk(article_ids, self.batch_size):
             batch_articles: List[Dict[str, Any]] = []
@@ -415,6 +720,7 @@ class BatchProcessor:
                     max_retries=self.max_retries,
                 )
                 batch_ids.append(batch_id)
+                active_batches.append(batch_id)
                 self.pending_batches.append(
                     {
                         "kind": "extraction",
@@ -428,6 +734,11 @@ class BatchProcessor:
                     batch_id,
                     len(batch_articles),
                 )
+
+                # Reuse the same submission throttling as classification to
+                # avoid exceeding the enqueued token limit during extraction.
+                self._throttle_inflight_batches(active_batches)
+
             except Exception as exc:
                 logger.error("Error submitting extraction batch: %s", exc)
 
@@ -440,25 +751,24 @@ class BatchProcessor:
             "Phase 2b: Polling %d extraction batches", len(batch_ids)
         )
 
-        for batch_id in batch_ids:
-            try:
-                status = self.provider.poll_batch_status(
-                    batch_id, max_retries=self.max_retries
-                )
-                logger.info(
-                    "Extraction batch %s: status=%s (processed=%s, failed=%s)",
+        # Use the same round-robin polling strategy as classification to avoid
+        # being blocked by a single slow or stuck extraction batch.
+        statuses = self._poll_batches_round_robin(
+            kind="extraction",
+            batch_ids=batch_ids,
+            per_batch_timeout_sec=15 * 60,
+        )
+
+        for batch_id, status in statuses.items():
+            if status.get("status") != "completed":
+                logger.warning(
+                    "Extraction batch %s ended with status=%s; skipping results",
                     batch_id,
-                    status["status"],
-                    status["processed"],
-                    status["failed"],
+                    status.get("status"),
                 )
+                continue
 
-                if status["status"] != "completed":
-                    logger.warning(
-                        "Extraction batch %s did not complete successfully", batch_id
-                    )
-                    continue
-
+            try:
                 results = self.provider.get_batch_results(batch_id)
 
                 for result in results:
@@ -614,8 +924,240 @@ class BatchProcessor:
             self.metrics["extracted_failed"] += 1
 
     # -----------------------
+    # Single-record Processing
+    # -----------------------
+
+    def process_articles_per_record(self) -> None:
+        """Process loaded articles synchronously, one-by-one.
+
+        This restores the legacy behaviour where each CSV row is classified
+        and, if relevant, extracted via direct OpenAI completion calls instead
+        of the batch API. The method updates :attr:`darshan_rows`,
+        :attr:`failed_records`, and :attr:`metrics` in-place.
+        """
+
+        logger.info("Per-record mode enabled: processing articles one-by-one")
+
+        classification_positive_ids: List[str] = []
+
+        for key in tqdm(
+            list(self.processed_articles.keys()),
+            desc="Classifying",
+            leave=False,
+        ):
+            article = self.processed_articles[key]
+            article_id = article.get("article_id")
+            title = article.get("title", "")
+            content = article.get("content", "")
+
+            if not article_id:
+                continue
+
+            classification: Optional[str] = None
+            classification_failed = False
+
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    classification = self.provider.classify_article(title, content)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Transient error classifying article %s (attempt %d/%d): %s",
+                        article_id,
+                        attempt,
+                        self.max_retries,
+                        exc,
+                    )
+                    if attempt == self.max_retries:
+                        logger.error("Giving up classifying article %s", article_id)
+                        self.failed_records.append(article["row"])
+                        classification_failed = True
+                    else:
+                        delay = self._retry_delay_for_exception(exc, attempt)
+                        status = getattr(exc, "http_status", None)
+                        logger.info(
+                            "Retrying classification for %s in %.1fs (status=%s)",
+                            article_id,
+                            delay,
+                            status,
+                        )
+                        time.sleep(delay)
+
+            if classification is None:
+                if not classification_failed:
+                    self.failed_records.append(article["row"])
+                continue
+
+            normalized = str(classification).strip().lower()
+            if not normalized:
+                self.failed_records.append(article["row"])
+                continue
+
+            logger.info("Classified article %s as %s", article_id, normalized)
+
+            if normalized != "true":
+                self.metrics["classified_false"] += 1
+                continue
+
+            self.metrics["classified_true"] += 1
+            classification_positive_ids.append(article_id)
+
+        for article_id in tqdm(
+            classification_positive_ids,
+            desc="Extracting",
+            leave=False,
+        ):
+            key = self.article_index.get(article_id)
+            if not key:
+                logger.warning(
+                    "Article %s not found in cache for extraction", article_id
+                )
+                continue
+
+            article = self.processed_articles.get(key)
+            if not article:
+                logger.warning(
+                    "Article cache entry missing for %s during extraction", article_id
+                )
+                continue
+
+            content = article.get("content", "")
+            extracted_payload: Optional[Any] = None
+            extraction_failed = False
+
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    raw_response = self.provider.extract_metrics(content)
+                    try:
+                        extracted_payload = json.loads(raw_response)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "Failed to parse extraction JSON for %s: %s",
+                            article_id,
+                            exc,
+                        )
+                        extracted_payload = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Transient error extracting metrics for %s (attempt %d/%d): %s",
+                        article_id,
+                        attempt,
+                        self.max_retries,
+                        exc,
+                    )
+                    if attempt == self.max_retries:
+                        logger.error("Giving up extraction for %s", article_id)
+                        extraction_failed = True
+                        self.failed_records.append(article["row"])
+                    else:
+                        delay = self._retry_delay_for_exception(exc, attempt)
+                        status = getattr(exc, "http_status", None)
+                        logger.info(
+                            "Retrying extraction for %s in %.1fs (status=%s)",
+                            article_id,
+                            delay,
+                            status,
+                        )
+                        time.sleep(delay)
+
+            if extracted_payload is None:
+                if not extraction_failed:
+                    self.failed_records.append(article["row"])
+                self.metrics["extracted_failed"] += 1
+                continue
+
+            if not isinstance(extracted_payload, dict):
+                logger.warning(
+                    "Extraction for article %s returned non-dict payload: %r",
+                    article_id,
+                    extracted_payload,
+                )
+                self.failed_records.append(article["row"])
+                self.metrics["extracted_failed"] += 1
+                continue
+
+            self._apply_extraction_result(article_id, extracted_payload)
+
+        self.metrics["final_records"] = len(self.darshan_rows)
+
+    # -----------------------
     # Persistence & Metrics
     # -----------------------
+
+    def list_batches(self, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return metadata for batches submitted by this processor.
+
+        Batches are recorded in :attr:`pending_batches` when they are submitted
+        for classification or extraction and persisted as part of the
+        :class:`ProcessorState` so they can be inspected later.
+
+        Args:
+            kind: Optional batch kind filter (e.g. "classification" or
+                "extraction"). When provided, only batches with a matching
+                ``kind`` field are returned.
+
+        Returns:
+            A new list with shallow copies of the recorded batch dictionaries.
+        """
+
+        if kind is None:
+            return [dict(batch) for batch in self.pending_batches]
+
+        return [
+            dict(batch)
+            for batch in self.pending_batches
+            if batch.get("kind") == kind
+        ]
+
+    @staticmethod
+    def list_batches_from_state(state_path: Path, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Load a saved state file and return its recorded batches.
+
+        This is a convenience for inspecting batches from a previous run
+        without instantiating a full :class:`BatchProcessor`.
+
+        Args:
+            state_path: Path to a ``darshan_state.json`` file produced by a
+                prior run.
+            kind: Optional batch kind filter (e.g. "classification" or
+                "extraction"). When provided, only batches with a matching
+                ``kind`` field are returned.
+
+        Returns:
+            A list of batch dictionaries recorded under ``pending_batches`` in
+            the state file. If the file does not exist or does not contain
+            ``pending_batches``, an empty list is returned.
+        """
+
+        path = Path(state_path)
+        if not path.exists():
+            logger.error("State file not found when listing batches: %s", path)
+            return []
+
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to read state file %s: %s", path, exc)
+            return []
+
+        pending = raw.get("pending_batches") or []
+        if not isinstance(pending, list):
+            logger.warning(
+                "State file %s has non-list pending_batches field; ignoring",
+                path,
+            )
+            return []
+
+        if kind is None:
+            return [dict(batch) for batch in pending if isinstance(batch, dict)]
+
+        return [
+            dict(batch)
+            for batch in pending
+            if isinstance(batch, dict) and batch.get("kind") == kind
+        ]
 
     def to_state(self) -> ProcessorState:
         return ProcessorState(
@@ -757,6 +1299,16 @@ def main() -> None:
         help="Max retries for batch submission/polling",
     )
     parser.add_argument(
+        "--max-inflight-batches",
+        type=int,
+        default=10,
+        help=(
+            "Maximum number of OpenAI batch jobs to keep in non-terminal "
+            "states at once. Lower values reduce the risk of hitting the "
+            "organization enqueued token limit."
+        ),
+    )
+    parser.add_argument(
         "--retry-failed",
         type=str,
         default=None,
@@ -782,6 +1334,12 @@ def main() -> None:
         ),
     )
 
+    parser.add_argument(
+        "--per-record",
+        action="store_true",
+        help="Process each article synchronously (one-by-one) instead of using batch API",
+    )
+
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -801,8 +1359,41 @@ def main() -> None:
     processor = BatchProcessor(
         batch_size=args.batch_size,
         max_retries=args.max_retries,
+        max_inflight_batches=args.max_inflight_batches,
         state_path=Path(args.state_file) if args.state_file else None,
     )
+
+    # Register signal handlers so the process can be cleanly interrupted
+    # when run under nohup or as a background job. SIGINT/SIGTERM will
+    # save state/output and exit; SIGUSR1 will trigger a save without
+    # exiting so you can snapshot progress on demand.
+    def _graceful_exit(signum, frame):
+        logger.warning("Received signal %s. Saving progress and exiting...", signum)
+        try:
+            processor.save_outputs()
+            processor.save_state()
+            processor.print_metrics()
+        except Exception as exc:
+            logger.error("Error during graceful shutdown: %s", exc)
+        sys.exit(1)
+
+    def _save_state_only(signum, frame):
+        logger.info("Received signal %s. Saving progress (no exit).", signum)
+        try:
+            processor.save_outputs()
+            processor.save_state()
+        except Exception as exc:
+            logger.error("Error saving state on signal %s: %s", signum, exc)
+
+    signal.signal(signal.SIGINT, _graceful_exit)
+    signal.signal(signal.SIGTERM, _graceful_exit)
+    # SIGUSR1 is commonly used to request saving state without terminating
+    # the process. Use `kill -USR1 <pid>` to trigger.
+    try:
+        signal.signal(signal.SIGUSR1, _save_state_only)
+    except AttributeError:
+        # Windows/Python may not have SIGUSR1; ignore if unavailable.
+        pass
 
     # Optional: load retry-failed CSV first
     if args.retry_failed:
@@ -827,29 +1418,36 @@ def main() -> None:
         logger.info("=" * 60)
         processor.load_articles_from_csv(data_dir)
 
-        # Phase 2: Submit and process classification
-        logger.info("=" * 60)
-        logger.info("PHASE 2: CLASSIFICATION")
-        logger.info("=" * 60)
-        classify_batch_ids = processor.submit_classification_batches()
-        classify_article_ids = processor.process_classification_results(
-            classify_batch_ids
-        )
+        if args.per_record:
+            processor.process_articles_per_record()
+            processor.save_outputs()
+            processor.save_state()
+            processor.print_metrics()
 
-        # Phase 3: Submit and process extraction
-        logger.info("=" * 60)
-        logger.info("PHASE 3: EXTRACTION")
-        logger.info("=" * 60)
-        extract_batch_ids = processor.submit_extraction_batches(classify_article_ids)
-        processor.process_extraction_results(extract_batch_ids)
+        else:
+            # Phase 2: Submit and process classification (batch)
+            logger.info("=" * 60)
+            logger.info("PHASE 2: CLASSIFICATION")
+            logger.info("=" * 60)
+            classify_batch_ids = processor.submit_classification_batches()
+            classify_article_ids = processor.process_classification_results(
+                classify_batch_ids
+            )
 
-        # Phase 4: Save outputs
-        logger.info("=" * 60)
-        logger.info("PHASE 4: SAVING OUTPUTS")
-        logger.info("=" * 60)
-        processor.save_outputs()
-        processor.save_state()
-        processor.print_metrics()
+            # Phase 3: Submit and process extraction (batch)
+            logger.info("=" * 60)
+            logger.info("PHASE 3: EXTRACTION")
+            logger.info("=" * 60)
+            extract_batch_ids = processor.submit_extraction_batches(classify_article_ids)
+            processor.process_extraction_results(extract_batch_ids)
+
+            # Phase 4: Save outputs
+            logger.info("=" * 60)
+            logger.info("PHASE 4: SAVING OUTPUTS")
+            logger.info("=" * 60)
+            processor.save_outputs()
+            processor.save_state()
+            processor.print_metrics()
 
     except KeyboardInterrupt:
         logger.warning("Interrupted by user. Saving progress and exiting...")
