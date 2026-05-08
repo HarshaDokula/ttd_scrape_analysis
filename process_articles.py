@@ -938,11 +938,9 @@ class BatchProcessor:
 
         logger.info("Per-record mode enabled: processing articles one-by-one")
 
-        classification_positive_ids: List[str] = []
-
         for key in tqdm(
             list(self.processed_articles.keys()),
-            desc="Classifying",
+            desc="Processing",
             leave=False,
         ):
             article = self.processed_articles[key]
@@ -1000,26 +998,6 @@ class BatchProcessor:
                 continue
 
             self.metrics["classified_true"] += 1
-            classification_positive_ids.append(article_id)
-
-        for article_id in tqdm(
-            classification_positive_ids,
-            desc="Extracting",
-            leave=False,
-        ):
-            key = self.article_index.get(article_id)
-            if not key:
-                logger.warning(
-                    "Article %s not found in cache for extraction", article_id
-                )
-                continue
-
-            article = self.processed_articles.get(key)
-            if not article:
-                logger.warning(
-                    "Article cache entry missing for %s during extraction", article_id
-                )
-                continue
 
             content = article.get("content", "")
             extracted_payload: Optional[Any] = None

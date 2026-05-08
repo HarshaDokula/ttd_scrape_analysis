@@ -185,6 +185,15 @@ class OpenAIProvider(BaseProvider):
         backoff_factor: float = 2.0,
         jitter: float = 3.0,
     ) -> Dict[str, Any]:
+        """Legacy helper that polls a single batch until it reaches a terminal state.
+
+        Newer code paths in :mod:`process_articles` prefer the lighter
+        :meth:`get_batch_status` in a round-robin loop to avoid getting stuck
+        on a single long-running batch. This method is kept for backward
+        compatibility and for tools that want simple "wait until done"
+        behaviour.
+        """
+
         attempts = 0
         error_retries = 0
 
@@ -241,6 +250,31 @@ class OpenAIProvider(BaseProvider):
 
         raise TimeoutError(f"Batch {batch_id} did not complete within timeout")
 
+    def get_batch_status(self, batch_id: str) -> Dict[str, Any]:
+        """Retrieve the current status for a single batch with one API call.
+
+        This is used by the batch processor to implement round-robin polling
+        across many batch IDs without blocking on any single one for too long.
+        """
+
+        batch = self.client.batches.retrieve(batch_id)
+        logger.info(
+            "Batch %s status=%s (processed=%s fail=%s)",
+            batch_id,
+            batch.status,
+            batch.request_counts.completed,
+            batch.request_counts.failed,
+        )
+        return {
+            "status": batch.status,
+            "processed": batch.request_counts.completed,
+            "failed": batch.request_counts.failed,
+            "submitted_at": getattr(batch, "created_at", None),
+            "completed_at": getattr(batch, "completed_at", None),
+            "output_file_id": getattr(batch, "output_file_id", None),
+            "error_file_id": getattr(batch, "error_file_id", None),
+        }
+
     # --- Results / Errors ---
 
     def get_batch_results(self, batch_id: str) -> List[Dict[str, Any]]:
@@ -263,13 +297,31 @@ class OpenAIProvider(BaseProvider):
             return self._error_cache[batch_id]
 
         batch = self.client.batches.retrieve(batch_id)
+
+        errors: List[Dict[str, Any]] = []
+
+        # Some failures (e.g. token_limit_exceeded) are reported inline on the
+        # Batch resource via ``batch.errors`` instead of an error file.
+        inline_errors = getattr(batch, "errors", None)
+        data = getattr(inline_errors, "data", None) if inline_errors else None
+        if data:
+            for err in data:
+                # Best-effort projection to a dict without depending on the
+                # exact SDK type.
+                code = getattr(err, "code", None)
+                message = getattr(err, "message", None)
+                errors.append({"code": code, "message": message})
+
         file_id = getattr(batch, "error_file_id", None)
-        if not file_id:
-            logger.info("Batch %s has no error file", batch_id)
+        if file_id:
+            lines = self._download_file(file_id)
+            file_errors = [json.loads(line) for line in lines if line]
+            errors.extend(file_errors)
+
+        if not errors:
+            logger.info("Batch %s has no error file or inline errors", batch_id)
             return []
 
-        lines = self._download_file(file_id)
-        errors = [json.loads(line) for line in lines if line]
         self._error_cache[batch_id] = errors
         logger.warning("Batch %s reported %s errors", batch_id, len(errors))
         return errors
@@ -292,6 +344,59 @@ class OpenAIProvider(BaseProvider):
                 return None
 
         return raw
+
+    # --- Batch Listing ---
+
+    def list_batches(
+        self,
+        *,
+        status: Optional[str] = None,
+        page_size: int = 100,
+        max_pages: int = 100,
+    ) -> List[Any]:
+        """List batches from OpenAI's `/v1/batches` endpoint.
+
+        This is a thin wrapper around ``client.batches.list`` that handles
+        pagination for you, returning a flat list of batch objects.
+
+        Args:
+            status: Optional status filter (e.g. "validating", "completed").
+            page_size: Number of items to request per page (``limit``).
+            max_pages: Safety cap on the number of pages to fetch.
+
+        Returns:
+            A list of batch objects as returned by the OpenAI SDK. Each object
+            has attributes such as ``id`` and ``status``.
+        """
+
+        all_batches: List[Any] = []
+        after: Optional[str] = None
+
+        for _ in range(max_pages):
+            kwargs: Dict[str, Any] = {"limit": page_size}
+            if after is not None:
+                kwargs["after"] = after
+            if status is not None:
+                kwargs["status"] = status
+
+            resp = self.client.batches.list(**kwargs)
+            page = list(getattr(resp, "data", []) or [])
+            if not page:
+                break
+
+            all_batches.extend(page)
+
+            has_more = bool(getattr(resp, "has_more", False))
+            if not has_more:
+                break
+
+            # Use the last item's id as the cursor for the next page.
+            last = page[-1]
+            after = getattr(last, "id", None)
+            if after is None:
+                break
+
+        return all_batches
 
     # --- Helpers ---
 
