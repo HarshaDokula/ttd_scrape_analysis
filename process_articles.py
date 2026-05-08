@@ -65,6 +65,15 @@ class ProcessorState:
     pending_batches: List[Dict[str, Any]]
 
 
+# Rate-limit thresholds for OpenAI gpt-4o-mini.
+# The RPD (requests-per-day) limit is 10,000. We pace proactively when
+# approaching it to avoid long stretches of 429 retries.
+RPD_LIMIT = 10_000
+RPD_WARN_THRESHOLD = 0.85   # start logging warnings at 85%
+RPD_PACE_THRESHOLD = 0.90   # start adding extra delay at 90%
+RPD_HARD_STOP = 0.98        # stop and warn if we somehow exceed 98%
+
+
 # ---------------------------
 # Batch Processor
 # ---------------------------
@@ -130,6 +139,10 @@ class BatchProcessor:
             "invalid_date": 0,
             "final_records": 0,
         }
+
+        # Rate-limit tracking: total requests made in this session
+        self._total_requests: int = 0
+        self._last_rpd_warning_pct: float = 0.0
 
     # -----------------------
     # Data Loading & Caching
@@ -250,20 +263,44 @@ class BatchProcessor:
 
         Respects ``Retry-After`` headers when present (e.g. for HTTP 429) and
         otherwise falls back to exponential backoff with jitter.
+
+        The OpenAI SDK (httpx) raises ``APIError`` exceptions that carry a
+        ``response`` attribute (an ``httpx.Response``) whose ``headers`` dict
+        contains the ``Retry-After`` header sent by the server.  We check
+        ``exc.response.headers`` first, then fall back to the legacy
+        ``exc.headers`` path for other exception types.
         """
 
-        headers = getattr(exc, "headers", None)
         retry_after: Optional[float] = None
-        if headers and hasattr(headers, "get"):
-            for key in ("Retry-After", "retry-after"):
-                value = headers.get(key)
-                if value is None:
-                    continue
-                try:
-                    retry_after = float(value)
-                    break
-                except (TypeError, ValueError):
-                    retry_after = None
+
+        # Try exc.response.headers first (OpenAI SDK APIError pattern)
+        response = getattr(exc, "response", None)
+        if response is not None:
+            resp_headers = getattr(response, "headers", None)
+            if resp_headers is not None and hasattr(resp_headers, "get"):
+                for key in ("Retry-After", "retry-after"):
+                    value = resp_headers.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        retry_after = float(value)
+                        break
+                    except (TypeError, ValueError):
+                        retry_after = None
+
+        # Fall back to exc.headers for other exception types
+        if retry_after is None:
+            headers = getattr(exc, "headers", None)
+            if headers and hasattr(headers, "get"):
+                for key in ("Retry-After", "retry-after"):
+                    value = headers.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        retry_after = float(value)
+                        break
+                    except (TypeError, ValueError):
+                        retry_after = None
 
         if retry_after is not None:
             delay = retry_after
@@ -285,6 +322,63 @@ class BatchProcessor:
             delay = 1
 
         return float(delay)
+
+    def _check_rate_limit(self) -> float:
+        """Check cumulative request count and return a pacing delay (seconds).
+
+        OpenAI's gpt-4o-mini has a 10,000 RPD (requests-per-day) limit.
+        Once we cross 85% usage, we log warnings.  At 90%+ we proactively
+        insert extra delay proportional to how close we are to the cap,
+        giving the daily bucket time to refill rather than hammering 429s.
+
+        Returns:
+            Seconds to sleep before the next request (0.0 if no pacing needed).
+        """
+        ratio = self._total_requests / RPD_LIMIT if RPD_LIMIT > 0 else 0.0
+
+        if ratio >= RPD_HARD_STOP:
+            logger.warning(
+                "RPD usage at %.1f%% (%d/%d) — approaching hard cap, "
+                "requests may fail until the daily window resets",
+                ratio * 100,
+                self._total_requests,
+                RPD_LIMIT,
+            )
+            # Sleep for a significant time to let the bucket drain
+            return 30.0
+
+        if ratio >= RPD_PACE_THRESHOLD:
+            # Exponential pacing: at 90% → 10s, 95% → 20s, 99% → 50s
+            over = (ratio - RPD_PACE_THRESHOLD) / (1.0 - RPD_PACE_THRESHOLD)
+            delay = 10.0 * (1.0 + over * 4.0)  # 10s at 90%, 50s at 100%
+
+            # Log at most once per 5% band to avoid log spam
+            band = round(ratio * 100 / 5) * 5
+            if band > self._last_rpd_warning_pct:
+                logger.warning(
+                    "RPD usage at %.1f%% (%d/%d) — pacing requests with %.1fs delay",
+                    ratio * 100,
+                    self._total_requests,
+                    RPD_LIMIT,
+                    delay,
+                )
+                self._last_rpd_warning_pct = band
+
+            return delay
+
+        if ratio >= RPD_WARN_THRESHOLD:
+            # Log warning once per 5% band
+            band = round(ratio * 100 / 5) * 5
+            if band > self._last_rpd_warning_pct:
+                logger.warning(
+                    "RPD usage at %.1f%% (%d/%d) — approaching rate limit",
+                    ratio * 100,
+                    self._total_requests,
+                    RPD_LIMIT,
+                )
+                self._last_rpd_warning_pct = band
+
+        return 0.0
 
     # -----------------------
     # Classification Workflow
@@ -954,9 +1048,15 @@ class BatchProcessor:
             classification: Optional[str] = None
             classification_failed = False
 
+            # Proactive rate-limit pacing before each request
+            pace_delay = self._check_rate_limit()
+            if pace_delay > 0:
+                time.sleep(pace_delay)
+
             for attempt in range(1, self.max_retries + 1):
                 try:
                     classification = self.provider.classify_article(title, content)
+                    self._total_requests += 1
                     break
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1003,9 +1103,15 @@ class BatchProcessor:
             extracted_payload: Optional[Any] = None
             extraction_failed = False
 
+            # Proactive rate-limit pacing before extraction request
+            pace_delay = self._check_rate_limit()
+            if pace_delay > 0:
+                time.sleep(pace_delay)
+
             for attempt in range(1, self.max_retries + 1):
                 try:
                     raw_response = self.provider.extract_metrics(content)
+                    self._total_requests += 1
                     try:
                         extracted_payload = json.loads(raw_response)
                     except Exception as exc:  # noqa: BLE001
@@ -1239,6 +1345,7 @@ class BatchProcessor:
         logger.info("Invalid dates (no day):     %d", self.metrics["invalid_date"])
         logger.info("Final unique dates:         %d", self.metrics["final_records"])
         logger.info("Total failed records:       %d", len(self.failed_records))
+        logger.info("Total API requests:         %d", self._total_requests)
 
         if self.metrics["total_loaded"] > 0:
             success_rate = (

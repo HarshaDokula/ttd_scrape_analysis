@@ -41,7 +41,10 @@ class OpenAIProvider(BaseProvider):
         self.completion_window = completion_window or os.getenv(
             "OPENAI_BATCH_COMPLETION_WINDOW", "24h"
         )
-        self.client = OpenAI(api_key=self.api_key)
+        # Disable SDK-level retry so our app-level retry has full control
+        # over timing, especially for RPD rate limits where the Retry-After
+        # header from OpenAI is misleading (8.64s won't reset a daily cap).
+        self.client = OpenAI(api_key=self.api_key, max_retries=0)
         self.poll_interval = 10
         self.max_poll_attempts = 1440
 

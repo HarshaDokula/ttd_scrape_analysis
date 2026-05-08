@@ -1,6 +1,20 @@
+#tests
+
+tests
+
 # Output data files for this project.
 *.json
 *.pkl
+*.csv
+nohup.out
+
+# Run output directories (generated processing data)
+output/
+full_run_1/
+logs/
+
+# Pi agent generated docs
+docs/
 
 # Test data
 example_data/*
