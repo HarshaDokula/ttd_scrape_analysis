@@ -23,15 +23,68 @@ load_dotenv()
 # ---------------------------
 
 
-_RUN_TIMESTAMP: str = ""
+_RUN_LABEL: str = ""
+
+
+def _random_run_name() -> str:
+    """Generate a Docker-style random name: adjective_noun."""
+    import random
+
+    adjectives = [
+        "admiring", "adoring", "agitated", "amazing", "angry", "awesome",
+        "blissful", "bold", "brave", "calm", "charming", "clever",
+        "compassionate", "confident", "cool", "cranky", "crazy", "dazzling",
+        "determined", "distracted", "dreamy", "eager", "ecstatic", "elastic",
+        "elated", "elegant", "eloquent", "epic", "fervent", "festive",
+        "flamboyant", "focused", "friendly", "frosty", "gallant", "gifted",
+        "goofy", "gracious", "happy", "hardcore", "hopeful", "hungry",
+        "inspiring", "jolly", "jovial", "keen", "kind", "laughing",
+        "loving", "lucid", "magical", "mighty", "musing", "nervous",
+        "nice", "nifty", "nostalgic", "optimistic", "peaceful", "pensive",
+        "practical", "priceless", "quirky", "quizzical", "recursing",
+        "relaxed", "reverent", "romantic", "sad", "serene", "sharp",
+        "silly", "sleepy", "stoic", "stupefied", "suspicious", "tender",
+        "thirsty", "trusting", "unruffled", "upbeat", "vibrant", "vigilant",
+        "vivid", "wizardly", "wonderful", "youthful", "zealous", "zen",
+    ]
+    nouns = [
+        "albattani", "almeida", "ardinghelli", "babbage", "banach",
+        "bardeen", "bartik", "bassi", "bell", "blackwell", "bohr",
+        "booth", "borg", "bose", "boyd", "brahmagupta", "brattain",
+        "brown", "carson", "chandrasekhar", "chebyshev", "clarke",
+        "cori", "cray", "curie", "davinci", "dijkstra", "dubinsky",
+        "easley", "einstein", "elion", "engelbart", "euclid", "euler",
+        "fermat", "fermi", "feynman", "franklin", "galileo", "gates",
+        "goldberg", "goldstine", "goodall", "hamilton", "hawking",
+        "heisenberg", "hermann", "hinton", "hopper", "hugle", "jones",
+        "jordan", "kalam", "keller", "kepler", "kilby", "khorana",
+        "kirch", "knuth", "kowalevski", "lalande", "lamarr", "leakey",
+        "leavitt", "lichterman", "liskov", "lovelace", "lumiere",
+        "mahavira", "mayer", "mccarthy", "mcclintock", "mclean",
+        "mcnulty", "meitner", "meninsky", "mestorf", "minsky",
+        "mirzakhani", "moore", "morse", "murdock", "neumann",
+        "newton", "nightingale", "nobel", "noether", "northcutt",
+        "noyce", "panini", "pare", "pasteur", "payne", "perlman",
+        "pike", "poincare", "poitras", "ptolemy", "raman", "ramanujan",
+        "ride", "ritchie", "roentgen", "rosalind", "saha", "sammet",
+        "shaw", "shirley", "shockley", "sinoussi", "snyder", "spence",
+        "stallman", "stonebraker", "swanson", "swirles", "taussig",
+        "tereshkova", "tesla", "thompson", "torvalds", "turing",
+        "varahamihira", "visvesvaraya", "volhard", "wescoff", "wiles",
+        "williams", "wilson", "wing", "wozniak", "wright", "yalow",
+        "yonath", "zhukovsky",
+    ]
+    return f"{random.choice(adjectives)}_{random.choice(nouns)}"
 
 
 def setup_logger() -> logging.Logger:
-    global _RUN_TIMESTAMP
+    global _RUN_LABEL
     logs_path = Path("logs")
     logs_path.mkdir(parents=True, exist_ok=True)
-    _RUN_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_filename = logs_path / f"log_{_RUN_TIMESTAMP}.log"
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    run_name = _random_run_name()
+    _RUN_LABEL = f"{timestamp}_{run_name}"
+    log_filename = logs_path / f"log_{_RUN_LABEL}.log"
 
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -210,7 +263,7 @@ class BatchProcessor:
             self.provider.max_tokens_per_request = max_tokens_per_request
 
         # Create default output directory with timestamp
-        self.output_dir = Path("output") / f"run_{_RUN_TIMESTAMP}"
+        self.output_dir = Path("output") / f"run_{_RUN_LABEL}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Allow caller to override where state is written; if provided,
@@ -1645,7 +1698,7 @@ def main() -> None:
         default=None,
         help=(
             "Optional path for saving incremental processing state "
-            "(defaults to output/run_TIMESTAMP/darshan_state.json)"
+            "(defaults to output/run_<timestamp>_<name>/darshan_state.json)"
         ),
     )
     parser.add_argument(
