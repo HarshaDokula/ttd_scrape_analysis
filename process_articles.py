@@ -130,8 +130,10 @@ RPD_HARD_STOP = 0.98        # stop and warn if we somehow exceed 98%
 DEFAULT_TPM_LIMIT = 2_000_000
 DEFAULT_TPM_PACE_THRESHOLD = 0.75
 DEFAULT_MAX_TOKENS_PER_REQUEST = 4096
-DEFAULT_MAX_TOKENS_PER_BATCH = 1_500_000  # 25% under OpenAI's 2M per-batch limit
+DEFAULT_MAX_TOKENS_PER_BATCH = 900_000  # conservative so multiple batches fit in enqueued budget
 DEFAULT_PER_BATCH_TIMEOUT_SEC = 86400  # 24 hours (matches OpenAI's completion window)
+DEFAULT_MAX_ENQUEUED_TOKENS = 2_000_000  # org-level enqueued (not per-batch) token limit
+DEFAULT_ENQUEUED_PACE_THRESHOLD = 0.75
 
 
 # ---------------------------
@@ -234,6 +236,8 @@ class BatchProcessor:
         tpm_limit: int = DEFAULT_TPM_LIMIT,
         tpm_pace_threshold: float = DEFAULT_TPM_PACE_THRESHOLD,
         per_batch_timeout_sec: int = DEFAULT_PER_BATCH_TIMEOUT_SEC,
+        max_enqueued_tokens: int = DEFAULT_MAX_ENQUEUED_TOKENS,
+        enqueued_pace_threshold: float = DEFAULT_ENQUEUED_PACE_THRESHOLD,
     ) -> None:
         if batch_size < 1 or batch_size > 10_000:
             raise ValueError("batch_size must be between 1 and 10_000")
@@ -243,6 +247,10 @@ class BatchProcessor:
             raise ValueError("max_tokens_per_batch must be at least 1")
         if max_tokens_per_request < 1:
             raise ValueError("max_tokens_per_request must be at least 1")
+        if max_enqueued_tokens < 1:
+            raise ValueError("max_enqueued_tokens must be at least 1")
+        if not 0 < enqueued_pace_threshold <= 1:
+            raise ValueError("enqueued_pace_threshold must be in (0, 1]")
 
         self.provider = provider or get_provider()
         self.batch_size = batch_size
@@ -257,6 +265,9 @@ class BatchProcessor:
             pace_threshold=tpm_pace_threshold,
         )
         self.per_batch_timeout_sec = per_batch_timeout_sec
+        self.max_enqueued_tokens = max_enqueued_tokens
+        self.enqueued_pace_threshold = enqueued_pace_threshold
+        self._enqueued_tokens: int = 0  # running total of enqueued tokens
 
         # Push token budget to provider (so it can truncate content accordingly)
         if hasattr(self.provider, "max_tokens_per_request"):
@@ -621,17 +632,35 @@ class BatchProcessor:
             self._estimate_request_tokens(item, kind) for item in items
         )
 
+    def _subtract_enqueued_tokens(self, batch_id: str) -> None:
+        """Subtract a batch's estimated tokens from the enqueued counter."""
+        for batch in self.pending_batches:
+            if batch.get("batch_id") == batch_id:
+                tokens = batch.get("estimated_tokens", 0)
+                if tokens > 0:
+                    self._enqueued_tokens = max(0, self._enqueued_tokens - tokens)
+                    logger.debug(
+                        "Freed %d enqueued tokens from batch %s (enqueued=%d)",
+                        tokens,
+                        batch_id,
+                        self._enqueued_tokens,
+                    )
+                break
+
     def _throttle_inflight_and_tpm(
         self,
         active_batch_ids: List[str],
         pending_tokens: int = 0,
     ) -> None:
-        """Block until both inflight batches and TPM allow a new submission.
+        """Block until inflight count, enqueued tokens, and TPM all allow submission.
 
-        Combines the old inflight-batch throttle with the new TPM sliding
-        window tracker. Waits until:
+        Waits until:
         1. ``len(active_batch_ids) < max_inflight_batches``
-        2. TPM tracker has room for *pending_tokens*
+        2. ``_enqueued_tokens + pending_tokens <= max_enqueued_tokens * enqueued_pace_threshold``
+        3. TPM tracker has room for *pending_tokens*
+
+        When inflight batches reach terminal state, their estimated tokens are
+        freed from the enqueued counter.
         """
 
         if self.max_inflight_batches <= 0 and pending_tokens <= 0:
@@ -639,9 +668,10 @@ class BatchProcessor:
 
         interval = getattr(self.provider, "poll_interval", 10)
         tpm_warning_logged = False
+        enqueued_warning_logged = False
 
         while True:
-            # --- Condition 1: not too many inflight batches ---
+            # --- Condition 1: poll inflight batches, free enqueued tokens ---
             if active_batch_ids:
                 for batch_id in list(active_batch_ids):
                     try:
@@ -656,9 +686,27 @@ class BatchProcessor:
 
                     state = status.get("status")
                     if state in {"completed", "failed", "expired"}:
+                        self._subtract_enqueued_tokens(batch_id)
                         active_batch_ids.remove(batch_id)
 
-            # --- Condition 2: TPM budget available ---
+            # --- Condition 2: enqueued token budget ---
+            enqueued_budget = int(self.max_enqueued_tokens * self.enqueued_pace_threshold)
+            if (
+                pending_tokens > 0
+                and (self._enqueued_tokens + pending_tokens) > enqueued_budget
+            ):
+                if not enqueued_warning_logged:
+                    logger.warning(
+                        "Enqueued tokens %d + %d > %d budget; waiting for batches to complete",
+                        self._enqueued_tokens,
+                        pending_tokens,
+                        enqueued_budget,
+                    )
+                    enqueued_warning_logged = True
+                time.sleep(interval)
+                continue
+
+            # --- Condition 3: TPM budget available ---
             if pending_tokens > 0 and not self.tpm_tracker.can_consume(pending_tokens):
                 if not tpm_warning_logged:
                     self.tpm_tracker.log_snapshot(label="waiting for TPM budget")
@@ -666,15 +714,22 @@ class BatchProcessor:
                 time.sleep(interval)
                 continue
 
-            # --- Both conditions met? ---
+            # --- All conditions met? ---
             if (
                 self.max_inflight_batches <= 0
                 or len(active_batch_ids) < self.max_inflight_batches
             ):
-                if pending_tokens > 0 and self.tpm_tracker.can_consume(pending_tokens):
-                    self.tpm_tracker.consume(pending_tokens)
-                    self.tpm_tracker.log_snapshot(label="after consume")
-                    return
+                if pending_tokens > 0:
+                    if self.tpm_tracker.can_consume(pending_tokens):
+                        self.tpm_tracker.consume(pending_tokens)
+                        self.tpm_tracker.log_snapshot(label="after consume")
+                        self._enqueued_tokens += pending_tokens
+                        logger.info(
+                            "Enqueued tokens: %d / %d",
+                            self._enqueued_tokens,
+                            self.max_enqueued_tokens,
+                        )
+                        return
 
             time.sleep(interval)
 
@@ -765,6 +820,7 @@ class BatchProcessor:
                     logger.error(
                         "%s batch %s: polling error: %s", pretty_kind, batch_id, exc
                     )
+                    self._subtract_enqueued_tokens(batch_id)
                     self._mark_batch_failed(batch_id, reason="polling error")
                     outstanding.remove(batch_id)
                     made_progress = True
@@ -780,6 +836,7 @@ class BatchProcessor:
 
                 if state in {"completed", "failed", "expired"}:
                     statuses[batch_id] = status
+                    self._subtract_enqueued_tokens(batch_id)
                     outstanding.remove(batch_id)
                     made_progress = True
 
@@ -822,6 +879,7 @@ class BatchProcessor:
                     status_with_timeout = dict(status)
                     status_with_timeout["status"] = "timeout"
                     statuses[batch_id] = status_with_timeout
+                    self._subtract_enqueued_tokens(batch_id)
                     outstanding.remove(batch_id)
                     try:
                         errors = self.provider.get_batch_errors(batch_id)
@@ -1647,6 +1705,13 @@ class BatchProcessor:
         logger.info("=" * 60)
         logger.info("TPM tracking:")
         self.tpm_tracker.log_snapshot(label="final")
+        logger.info(
+            "Enqueued tokens: %d / %d (%.1f%%)",
+            self._enqueued_tokens,
+            self.max_enqueued_tokens,
+            self._enqueued_tokens / self.max_enqueued_tokens * 100
+            if self.max_enqueued_tokens > 0 else 0.0,
+        )
         logger.info("=" * 60)
 
 
@@ -1766,6 +1831,25 @@ def main() -> None:
             f"(default: {DEFAULT_PER_BATCH_TIMEOUT_SEC})"
         ),
     )
+    parser.add_argument(
+        "--max-enqueued-tokens",
+        type=int,
+        default=DEFAULT_MAX_ENQUEUED_TOKENS,
+        help=(
+            f"Organization enqueued token limit (not per-batch). Total tokens "
+            f"across all non-terminal batches must stay under this. "
+            f"Found via batch error messages. (default: {DEFAULT_MAX_ENQUEUED_TOKENS})"
+        ),
+    )
+    parser.add_argument(
+        "--enqueued-pace-threshold",
+        type=float,
+        default=DEFAULT_ENQUEUED_PACE_THRESHOLD,
+        help=(
+            f"Fraction of enqueued token limit at which to pause submissions "
+            f"until batches complete. (default: {DEFAULT_ENQUEUED_PACE_THRESHOLD})"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1794,6 +1878,8 @@ def main() -> None:
         tpm_limit=args.tpm_limit,
         tpm_pace_threshold=args.tpm_pace_threshold,
         per_batch_timeout_sec=args.per_batch_timeout,
+        max_enqueued_tokens=args.max_enqueued_tokens,
+        enqueued_pace_threshold=args.enqueued_pace_threshold,
     )
 
     # Register signal handlers so the process can be cleanly interrupted

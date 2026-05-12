@@ -61,6 +61,8 @@ Key CLI arguments for tuning:
 | `--tpm-limit` | 2,000,000 | Organization TPM (tokens per minute) limit. Used to pace batch submissions. |
 | `--tpm-pace-threshold` | 0.75 | Fraction of TPM at which to start pacing submissions (default: 75%). |
 | `--per-batch-timeout` | 86400 | Seconds before giving up on a batch (default 24h, matches OpenAI's completion window). Batches at `processed=0` are usually just queued — increase this rather than cancelling. |
+| `--max-enqueued-tokens` | 2,000,000 | Org-level enqueued token limit (from batch error messages). Total tokens across all non-terminal batches must stay under this. |
+| `--enqueued-pace-threshold` | 0.75 | Fraction of enqueued limit at which to pause submissions until batches complete. |
 
 Example with custom settings:
 
@@ -142,11 +144,12 @@ Example safe workflow to stop a run:
 
 ## Rate limit management
 
-### Three rate limit layers
+### Rate limit layers
 
-1. **Per-batch token limit** (2M input tokens): If a batch exceeds this, it stays `in_progress` with `processed=0` forever. Mitigated by `--max-tokens-per-batch` (default 1.5M).
-2. **TPM (Tokens Per Minute)**: Organization-level throughput cap. When exceeded, new batches queue at `processed=0`. Mitigated by the TPM sliding-window tracker that paces submissions to stay under `TPM_LIMIT * pace_threshold`.
-3. **Enqueued token limit**: Total tokens across all in-flight batches. Mitigated by `--max-inflight-batches`.
+1. **Per-batch token limit** (2M input tokens): If a batch exceeds this, it fails with `token_limit_exceeded`. Mitigated by token-budget batching (`--max-tokens-per-batch`).
+2. **Enqueued token limit** (2M total): Total tokens across ALL non-terminal batches. If exceeded, new batches are rejected. Mitigated by `--max-enqueued-tokens` and `--enqueued-pace-threshold` — the processor tracks the running total and waits for batches to complete before submitting more.
+3. **TPM (Tokens Per Minute)**: Organization-level throughput cap. When exceeded, batches queue at `processed=0`. Mitigated by the TPM sliding-window tracker.
+4. **Enqueued batch count**: Max number of concurrent batch jobs. Mitigated by `--max-inflight-batches`.
 
 ### TPM sliding window tracker
 
