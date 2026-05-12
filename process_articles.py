@@ -8,7 +8,7 @@ import signal
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -73,6 +73,87 @@ RPD_WARN_THRESHOLD = 0.85   # start logging warnings at 85%
 RPD_PACE_THRESHOLD = 0.90   # start adding extra delay at 90%
 RPD_HARD_STOP = 0.98        # stop and warn if we somehow exceed 98%
 
+# Path A: TPM tracking defaults
+DEFAULT_TPM_LIMIT = 2_000_000
+DEFAULT_TPM_PACE_THRESHOLD = 0.75
+DEFAULT_MAX_TOKENS_PER_REQUEST = 4096
+DEFAULT_MAX_TOKENS_PER_BATCH = 1_500_000  # 25% under OpenAI's 2M per-batch limit
+DEFAULT_PER_BATCH_TIMEOUT_SEC = 3600  # 60 minutes (was 15)
+
+
+# ---------------------------
+# TPM Sliding Window Tracker
+# ---------------------------
+
+
+class TPMSlidingWindow:
+    """Track tokens-per-minute consumption with a sliding window.
+
+    Records token consumption events and reports whether new submissions
+    would exceed the configured TPM threshold. Use before each batch
+    submission to pace against the organization-level TPM limit.
+    """
+
+    def __init__(
+        self,
+        tpm_limit: int = DEFAULT_TPM_LIMIT,
+        pace_threshold: float = DEFAULT_TPM_PACE_THRESHOLD,
+        window_sec: int = 60,
+    ) -> None:
+        if tpm_limit <= 0:
+            raise ValueError("tpm_limit must be positive")
+        if not 0 < pace_threshold <= 1:
+            raise ValueError("pace_threshold must be in (0, 1]")
+
+        self.tpm_limit = tpm_limit
+        self.pace_threshold = pace_threshold
+        self.window_sec = window_sec
+        self._history: List[Tuple[float, int]] = []  # (timestamp, token_count)
+
+    def current_tpm(self) -> int:
+        """Return the total tokens consumed within the current sliding window."""
+        cutoff = time.time() - self.window_sec
+        self._history = [(t, c) for t, c in self._history if t > cutoff]
+        return sum(c for _, c in self._history)
+
+    def can_consume(self, tokens: int) -> bool:
+        """Return True if consuming *tokens* stays within the pace threshold."""
+        return (self.current_tpm() + tokens) <= (self.tpm_limit * self.pace_threshold)
+
+    def consume(self, tokens: int) -> None:
+        """Record *tokens* consumed at the current time."""
+        self._history.append((time.time(), tokens))
+
+    def wait_until_ready(self, tokens: int, max_wait_sec: float = 300.0) -> float:
+        """Block until *tokens* can be consumed, then record them.
+
+        Polls every 5 seconds. Returns the total seconds waited, or raises
+        :class:`TimeoutError` if *max_wait_sec* is exceeded.
+        """
+        waited = 0.0
+        while not self.can_consume(tokens):
+            if waited >= max_wait_sec:
+                raise TimeoutError(
+                    f"TPM tracker waited {waited:.0f}s for {tokens} tokens but "
+                    f"window is saturated ({self.current_tpm()}/{self.tpm_limit})"
+                )
+            time.sleep(5.0)
+            waited += 5.0
+        self.consume(tokens)
+        return waited
+
+    def log_snapshot(self, label: str = "") -> None:
+        """Log current TPM usage for monitoring."""
+        current = self.current_tpm()
+        pct = current / self.tpm_limit * 100 if self.tpm_limit > 0 else 0.0
+        logger.info(
+            "TPM%s: %d / %d (%.1f%%)",
+            f" [{label}]" if label else "",
+            current,
+            self.tpm_limit,
+            pct,
+        )
+
 
 # ---------------------------
 # Batch Processor
@@ -94,16 +175,39 @@ class BatchProcessor:
         max_retries: int = 3,
         max_inflight_batches: int = 10,
         state_path: Optional[Path] = None,
+        # ── Path A parameters ──────────────────────────────────────────────
+        max_tokens_per_request: int = DEFAULT_MAX_TOKENS_PER_REQUEST,
+        max_tokens_per_batch: int = DEFAULT_MAX_TOKENS_PER_BATCH,
+        tpm_limit: int = DEFAULT_TPM_LIMIT,
+        tpm_pace_threshold: float = DEFAULT_TPM_PACE_THRESHOLD,
+        per_batch_timeout_sec: int = DEFAULT_PER_BATCH_TIMEOUT_SEC,
     ) -> None:
         if batch_size < 1 or batch_size > 10_000:
             raise ValueError("batch_size must be between 1 and 10_000")
         if max_inflight_batches < 1:
             raise ValueError("max_inflight_batches must be at least 1")
+        if max_tokens_per_batch < 1:
+            raise ValueError("max_tokens_per_batch must be at least 1")
+        if max_tokens_per_request < 1:
+            raise ValueError("max_tokens_per_request must be at least 1")
 
         self.provider = provider or get_provider()
         self.batch_size = batch_size
         self.max_retries = max_retries
         self.max_inflight_batches = max_inflight_batches
+
+        # Path A: token budget and TPM tracking
+        self.max_tokens_per_request = max_tokens_per_request
+        self.max_tokens_per_batch = max_tokens_per_batch
+        self.tpm_tracker = TPMSlidingWindow(
+            tpm_limit=tpm_limit,
+            pace_threshold=tpm_pace_threshold,
+        )
+        self.per_batch_timeout_sec = per_batch_timeout_sec
+
+        # Push token budget to provider (so it can truncate content accordingly)
+        if hasattr(self.provider, "max_tokens_per_request"):
+            self.provider.max_tokens_per_request = max_tokens_per_request
 
         # Create default output directory with timestamp
         self.output_dir = Path("output") / f"run_{_RUN_TIMESTAMP}"
@@ -234,8 +338,79 @@ class BatchProcessor:
         logger.info("Loaded %d articles for processing", self.metrics["total_loaded"])
 
     # -----------------------
-    # Batch Helpers
+    # Token-aware Batching
     # -----------------------
+
+    def _estimate_request_tokens(self, article: Dict[str, Any], kind: str) -> int:
+        """Estimate the token count for a single article request.
+
+        Uses the provider's token counter if available; otherwise falls back
+        to a character-based estimate.
+        """
+        content = article.get("content", "")
+        if hasattr(self.provider, "count_request_tokens"):
+            return self.provider.count_request_tokens(content)
+
+        # Fallback estimate: prompt overhead (~200 tokens) + content
+        prompt_overhead = 200
+        return prompt_overhead + len(content) // 4
+
+    def _chunk_by_token_budget(
+        self,
+        articles: List[Dict[str, Any]],
+        kind: str,
+    ) -> List[List[Dict[str, Any]]]:
+        """Split *articles* into batches that each fit within the token budget.
+
+        Uses exact token counts via the provider (which uses tiktoken) to
+        ensure no batch exceeds ``max_tokens_per_batch``. Replaces the old
+        ``_chunk`` fixed-size batching.
+        """
+
+        batches: List[List[Dict[str, Any]]] = []
+        current_batch: List[Dict[str, Any]] = []
+        current_tokens = 0
+
+        for article in articles:
+            tokens = self._estimate_request_tokens(article, kind)
+
+            # If a single article exceeds the per-batch budget, log a warning
+            # and put it in its own batch anyway
+            if tokens > self.max_tokens_per_batch:
+                logger.warning(
+                    "Article %s alone uses ~%d tokens, exceeding per-batch budget %d",
+                    article.get("article_id", "?"),
+                    tokens,
+                    self.max_tokens_per_batch,
+                )
+                if current_batch:
+                    batches.append(current_batch)
+                    current_tokens = 0
+                current_batch = [article]
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+                continue
+
+            if current_tokens + tokens > self.max_tokens_per_batch:
+                batches.append(current_batch)
+                current_batch = [article]
+                current_tokens = tokens
+            else:
+                current_batch.append(article)
+                current_tokens += tokens
+
+        if current_batch:
+            batches.append(current_batch)
+
+        logger.info(
+            "Token-budget batching: %d articles split into %d batches "
+            "(budget=%d tokens/batch)",
+            len(articles),
+            len(batches),
+            self.max_tokens_per_batch,
+        )
+        return batches
 
     @staticmethod
     def _chunk(iterable: Iterable[Any], size: int) -> Iterable[List[Any]]:
@@ -318,6 +493,9 @@ class BatchProcessor:
         except Exception:
             pass
 
+        # Clamp again after jitter to guarantee max_delay is respected
+        delay = min(max_delay, delay)
+
         if delay < 1:
             delay = 1
 
@@ -381,47 +559,71 @@ class BatchProcessor:
         return 0.0
 
     # -----------------------
-    # Classification Workflow
+    # TPM-guided Batch Submission
     # -----------------------
 
-    def _throttle_inflight_batches(self, active_batch_ids: List[str]) -> None:
-        """Block until the number of in-flight batches is below the limit.
+    def _estimate_batch_tokens(self, items: List[Dict[str, Any]], kind: str) -> int:
+        """Estimate the total token count for a batch of articles."""
+        return sum(
+            self._estimate_request_tokens(item, kind) for item in items
+        )
 
-        This is used during submission to avoid exceeding OpenAI's
-        organization-wide enqueued token limit by having too many batches
-        simultaneously in non-terminal states.
+    def _throttle_inflight_and_tpm(
+        self,
+        active_batch_ids: List[str],
+        pending_tokens: int = 0,
+    ) -> None:
+        """Block until both inflight batches and TPM allow a new submission.
+
+        Combines the old inflight-batch throttle with the new TPM sliding
+        window tracker. Waits until:
+        1. ``len(active_batch_ids) < max_inflight_batches``
+        2. TPM tracker has room for *pending_tokens*
         """
 
-        if self.max_inflight_batches <= 0:
-            return
-
-        if not active_batch_ids:
+        if self.max_inflight_batches <= 0 and pending_tokens <= 0:
             return
 
         interval = getattr(self.provider, "poll_interval", 10)
+        tpm_warning_logged = False
 
-        while len(active_batch_ids) >= self.max_inflight_batches:
-            for batch_id in list(active_batch_ids):
-                try:
-                    status = self.provider.get_batch_status(batch_id)
-                except Exception as exc:  # noqa: BLE001
-                    logger.error(
-                        "Error checking status for inflight batch %s: %s",
-                        batch_id,
-                        exc,
-                    )
-                    continue
+        while True:
+            # --- Condition 1: not too many inflight batches ---
+            if active_batch_ids:
+                for batch_id in list(active_batch_ids):
+                    try:
+                        status = self.provider.get_batch_status(batch_id)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "Error checking status for inflight batch %s: %s",
+                            batch_id,
+                            exc,
+                        )
+                        continue
 
-                state = status.get("status")
-                if state in {"completed", "failed", "expired"}:
-                    # From a submission-throttling perspective, any terminal
-                    # state frees capacity. The detailed handling for
-                    # failed/expired/timeouts happens later during result
-                    # processing.
-                    active_batch_ids.remove(batch_id)
+                    state = status.get("status")
+                    if state in {"completed", "failed", "expired"}:
+                        active_batch_ids.remove(batch_id)
 
-            if len(active_batch_ids) >= self.max_inflight_batches:
+            # --- Condition 2: TPM budget available ---
+            if pending_tokens > 0 and not self.tpm_tracker.can_consume(pending_tokens):
+                if not tpm_warning_logged:
+                    self.tpm_tracker.log_snapshot(label="waiting for TPM budget")
+                    tpm_warning_logged = True
                 time.sleep(interval)
+                continue
+
+            # --- Both conditions met? ---
+            if (
+                self.max_inflight_batches <= 0
+                or len(active_batch_ids) < self.max_inflight_batches
+            ):
+                if pending_tokens > 0 and self.tpm_tracker.can_consume(pending_tokens):
+                    self.tpm_tracker.consume(pending_tokens)
+                    self.tpm_tracker.log_snapshot(label="after consume")
+                    return
+
+            time.sleep(interval)
 
     def _get_batch_article_ids(self, batch_id: str) -> List[str]:
         """Return the article_ids recorded for a given batch_id, if any."""
@@ -469,7 +671,6 @@ class BatchProcessor:
         *,
         kind: str,
         batch_ids: List[str],
-        per_batch_timeout_sec: int = 15 * 60,
     ) -> Dict[str, Dict[str, Any]]:
         """Poll multiple batches in a round-robin fashion until they settle.
 
@@ -625,21 +826,29 @@ class BatchProcessor:
         return statuses
 
     def submit_classification_batches(self) -> List[str]:
-        """Submit all loaded articles for classification in batches."""
+        """Submit all loaded articles for classification in batches.
+
+        Uses token-budget-aware batching (Path A) instead of fixed-size
+        batches. Each batch is sized to stay within ``max_tokens_per_batch``.
+        """
 
         articles_list = list(self.processed_articles.values())
         batch_ids: List[str] = []
 
         logger.info(
-            "Phase 1: Submitting %d articles for classification (batch_size=%d, max_inflight_batches=%d)",
+            "Phase 1: Submitting %d articles for classification "
+            "(max_tokens_per_request=%d, max_tokens_per_batch=%d, "
+            "max_inflight_batches=%d)",
             len(articles_list),
-            self.batch_size,
+            self.max_tokens_per_request,
+            self.max_tokens_per_batch,
             self.max_inflight_batches,
         )
 
         active_batches: List[str] = []
 
-        for batch in self._chunk(articles_list, self.batch_size):
+        # Path A: token-budget-based batching
+        for batch in self._chunk_by_token_budget(articles_list, "classification"):
             items = [
                 {
                     "article_id": art["article_id"],
@@ -648,6 +857,9 @@ class BatchProcessor:
                 }
                 for art in batch
             ]
+
+            # Estimate batch token count for TPM tracking
+            batch_tokens = self._estimate_batch_tokens(batch, "classification")
 
             try:
                 requests_jsonl = self.provider.build_batch_requests(
@@ -665,18 +877,19 @@ class BatchProcessor:
                         "kind": "classification",
                         "batch_id": batch_id,
                         "article_ids": [a["article_id"] for a in batch],
+                        "estimated_tokens": batch_tokens,
                     }
                 )
                 logger.info(
-                    "Submitted classification batch %d: %s (%d articles)",
+                    "Submitted classification batch %d: %s (%d articles, ~%d tokens)",
                     len(batch_ids),
                     batch_id,
                     len(batch),
+                    batch_tokens,
                 )
 
-                # Throttle submissions so we don't accumulate too many batches
-                # in non-terminal states and hit the enqueued token limit.
-                self._throttle_inflight_batches(active_batches)
+                # Path A: TPM + inflight-aware throttle before next submission
+                self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
 
             except Exception as exc:  # network/API errors; logged + mark failed
                 logger.error("Error submitting classification batch: %s", exc)
@@ -703,7 +916,6 @@ class BatchProcessor:
         statuses = self._poll_batches_round_robin(
             kind="classification",
             batch_ids=batch_ids,
-            per_batch_timeout_sec=15 * 60,
         )
 
         for batch_id, status in statuses.items():
@@ -774,39 +986,50 @@ class BatchProcessor:
     # -----------------------
 
     def submit_extraction_batches(self, article_ids: List[str]) -> List[str]:
-        """Submit classified-TRUE articles for metric extraction."""
+        """Submit classified-TRUE articles for metric extraction.
+
+        Uses token-budget-aware batching (Path A).
+        """
 
         logger.info(
             "Phase 2: Submitting %d articles for metric extraction", len(article_ids)
         )
 
+        # Build the full article dicts for token-budget batching
+        batch_articles_all: List[Dict[str, Any]] = []
+        for article_id in article_ids:
+            key = self.article_index.get(article_id)
+            if not key:
+                logger.warning(
+                    "Article %s not found in cache when building extraction batch",
+                    article_id,
+                )
+                continue
+            article = self.processed_articles[key]
+            batch_articles_all.append(article)
+
+        if not batch_articles_all:
+            logger.warning("No articles to submit for extraction")
+            return []
+
         batch_ids: List[str] = []
         active_batches: List[str] = []
 
-        for id_batch in self._chunk(article_ids, self.batch_size):
-            batch_articles: List[Dict[str, Any]] = []
-            for article_id in id_batch:
-                key = self.article_index.get(article_id)
-                if not key:
-                    logger.warning(
-                        "Article %s not found in cache when building extraction batch",
-                        article_id,
-                    )
-                    continue
-                article = self.processed_articles[key]
-                batch_articles.append(
-                    {
-                        "article_id": article_id,
-                        "content": article["content"],
-                    }
-                )
+        for batch in self._chunk_by_token_budget(batch_articles_all, "extraction"):
+            batch_items = [
+                {
+                    "article_id": art["article_id"],
+                    "content": art["content"],
+                }
+                for art in batch
+            ]
 
-            if not batch_articles:
-                continue
+            # Estimate batch token count for TPM tracking
+            batch_tokens = self._estimate_batch_tokens(batch, "extraction")
 
             try:
                 requests_jsonl = self.provider.build_batch_requests(
-                    "extraction", batch_articles
+                    "extraction", batch_items
                 )
                 batch_id = self.provider.submit_batch(
                     "extraction",
@@ -819,19 +1042,20 @@ class BatchProcessor:
                     {
                         "kind": "extraction",
                         "batch_id": batch_id,
-                        "article_ids": id_batch,
+                        "article_ids": [a["article_id"] for a in batch],
+                        "estimated_tokens": batch_tokens,
                     }
                 )
                 logger.info(
-                    "Submitted extraction batch %d: %s (%d articles)",
+                    "Submitted extraction batch %d: %s (%d articles, ~%d tokens)",
                     len(batch_ids),
                     batch_id,
-                    len(batch_articles),
+                    len(batch_items),
+                    batch_tokens,
                 )
 
-                # Reuse the same submission throttling as classification to
-                # avoid exceeding the enqueued token limit during extraction.
-                self._throttle_inflight_batches(active_batches)
+                # Path A: TPM + inflight-aware throttle before next submission
+                self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
 
             except Exception as exc:
                 logger.error("Error submitting extraction batch: %s", exc)
@@ -850,7 +1074,6 @@ class BatchProcessor:
         statuses = self._poll_batches_round_robin(
             kind="extraction",
             batch_ids=batch_ids,
-            per_batch_timeout_sec=15 * 60,
         )
 
         for batch_id, status in statuses.items():
@@ -1355,6 +1578,9 @@ class BatchProcessor:
             )
             logger.info("Overall success rate:       %.1f%%", success_rate)
         logger.info("=" * 60)
+        logger.info("Path A TPM tracking:")
+        self.tpm_tracker.log_snapshot(label="final")
+        logger.info("=" * 60)
 
 
 # ---------------------------
@@ -1425,6 +1651,55 @@ def main() -> None:
         help="Process each article synchronously (one-by-one) instead of using batch API",
     )
 
+    # ── Path A arguments ──────────────────────────────────────────────────
+    parser.add_argument(
+        "--max-tokens-per-request",
+        type=int,
+        default=DEFAULT_MAX_TOKENS_PER_REQUEST,
+        help=(
+            f"Maximum tokens of article content per API request. "
+            f"Content beyond this is truncated via tiktoken. (default: {DEFAULT_MAX_TOKENS_PER_REQUEST})"
+        ),
+    )
+    parser.add_argument(
+        "--max-tokens-per-batch",
+        type=int,
+        default=DEFAULT_MAX_TOKENS_PER_BATCH,
+        help=(
+            f"Maximum tokens per batch file (keep under OpenAI's 2M limit). "
+            f"Batches are dynamically sized to not exceed this budget. "
+            f"(default: {DEFAULT_MAX_TOKENS_PER_BATCH})"
+        ),
+    )
+    parser.add_argument(
+        "--tpm-limit",
+        type=int,
+        default=DEFAULT_TPM_LIMIT,
+        help=(
+            f"Organization TPM (tokens per minute) limit. Used by the TPM sliding "
+            f"window tracker to pace batch submissions. (default: {DEFAULT_TPM_LIMIT})"
+        ),
+    )
+    parser.add_argument(
+        "--tpm-pace-threshold",
+        type=float,
+        default=DEFAULT_TPM_PACE_THRESHOLD,
+        help=(
+            f"Fraction of TPM limit at which to start pacing. "
+            f"(default: {DEFAULT_TPM_PACE_THRESHOLD})"
+        ),
+    )
+    parser.add_argument(
+        "--per-batch-timeout",
+        type=int,
+        default=DEFAULT_PER_BATCH_TIMEOUT_SEC,
+        help=(
+            f"Seconds before giving up on a batch during polling. "
+            f"Higher values help when batches are queued behind TPM limits. "
+            f"(default: {DEFAULT_PER_BATCH_TIMEOUT_SEC})"
+        ),
+    )
+
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -1446,6 +1721,12 @@ def main() -> None:
         max_retries=args.max_retries,
         max_inflight_batches=args.max_inflight_batches,
         state_path=Path(args.state_file) if args.state_file else None,
+        # ── Path A ────────────────────────────────────────────────────────
+        max_tokens_per_request=args.max_tokens_per_request,
+        max_tokens_per_batch=args.max_tokens_per_batch,
+        tpm_limit=args.tpm_limit,
+        tpm_pace_threshold=args.tpm_pace_threshold,
+        per_batch_timeout_sec=args.per_batch_timeout,
     )
 
     # Register signal handlers so the process can be cleanly interrupted

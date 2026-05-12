@@ -19,6 +19,41 @@ RETRYABLE_STATUS_CODES = {429} | set(range(500, 600))
 DEFAULT_MAX_SUBMIT_RETRIES = 3
 RETRYABLE_ERRNOS = {11, 104, 110}
 
+# ── tiktoken: exact token counting ──────────────────────────────────────────
+try:
+    import tiktoken
+
+    _TIKTOKEN_AVAILABLE = True
+except ImportError:
+    _TIKTOKEN_AVAILABLE = False
+    logger.warning("tiktoken not available; falling back to char/4 heuristic")
+
+
+def count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
+    """Return exact token count for *text* using tiktoken, or an estimate."""
+    if _TIKTOKEN_AVAILABLE:
+        try:
+            enc = tiktoken.encoding_for_model(model)
+            return len(enc.encode(text))
+        except Exception:
+            pass
+    return len(text) // 4
+
+
+def truncate_to_token_budget(text: str, max_tokens: int, model: str = "gpt-4o-mini") -> str:
+    """Truncate *text* so it fits within *max_tokens* tokens."""
+    if _TIKTOKEN_AVAILABLE:
+        try:
+            enc = tiktoken.encoding_for_model(model)
+            tokens = enc.encode(text)
+            if len(tokens) <= max_tokens:
+                return text
+            return enc.decode(tokens[:max_tokens])
+        except Exception:
+            pass
+    max_chars = max_tokens * 4
+    return text[:max_chars] if len(text) > max_chars else text
+
 
 class OpenAIProvider(BaseProvider):
     """OpenAI provider with resilient batch helpers for TTD processing.
@@ -32,8 +67,10 @@ class OpenAIProvider(BaseProvider):
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         completion_window: Optional[str] = None,
+        max_tokens_per_request: int = 4096,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.max_tokens_per_request = max_tokens_per_request
         if not self.api_key:
             raise ValueError("Missing OpenAI API key")
 
@@ -51,14 +88,26 @@ class OpenAIProvider(BaseProvider):
         self._result_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._error_cache: Dict[str, List[Dict[str, Any]]] = {}
 
+    # ── Token helpers ──────────────────────────────────────────────────────
+
+    def count_request_tokens(self, content: str) -> int:
+        """Return exact token count for *content* using this provider's model."""
+        return count_tokens(content, self.model)
+
+    def truncate_content(self, content: str) -> str:
+        """Truncate article *content* to the configured per-request token budget."""
+        return truncate_to_token_budget(content, self.max_tokens_per_request, self.model)
+
     # --- Legacy single-article API (BaseProvider) ---
 
     def classify_article(self, title: str, content: str) -> str:  # type: ignore[override]
         """Synchronously classify a single article as 'true' or 'false'."""
 
+        truncated = self.truncate_content(content or "")
         prompt = ttd_prompt_tmpl3.format(
             title=title or "",
-            article_text=(content or "")[:800],
+            article_text=truncated,
+            token_budget=self.max_tokens_per_request,
         )
         response = self.client.chat.completions.create(
             model=self.model,
@@ -72,8 +121,10 @@ class OpenAIProvider(BaseProvider):
     def extract_metrics(self, content: str) -> str:  # type: ignore[override]
         """Synchronously extract metrics JSON string for a single article."""
 
+        truncated = self.truncate_content(content or "")
         prompt = ttd_info_extract_prompt_tmpl_v2.format(
-            article_text=(content or "")[:800]
+            article_text=truncated,
+            token_budget=self.max_tokens_per_request,
         )
         response = self.client.chat.completions.create(
             model=self.model,
@@ -91,9 +142,11 @@ class OpenAIProvider(BaseProvider):
         requests: List[Dict[str, Any]] = []
         for item in items:
             if kind == "classification":
+                truncated = self.truncate_content(item.get("content", ""))
                 prompt = ttd_prompt_tmpl3.format(
                     title=item.get("title", ""),
-                    article_text=item.get("content", "")[:800],
+                    article_text=truncated,
+                    token_budget=self.max_tokens_per_request,
                 )
                 body = {
                     "model": self.model,
@@ -102,8 +155,10 @@ class OpenAIProvider(BaseProvider):
                     "max_tokens": 2,
                 }
             else:
+                truncated = self.truncate_content(item.get("content", ""))
                 prompt = ttd_info_extract_prompt_tmpl_v2.format(
-                    article_text=item.get("content", "")[:800]
+                    article_text=truncated,
+                    token_budget=self.max_tokens_per_request,
                 )
                 body = {
                     "model": self.model,

@@ -12,7 +12,7 @@ Return ONLY the token "true" or "false" (lowercase) and nothing else.
   - General news about arrangements, facilities, or pilgrim guidance without concrete counts
   - Articles mentioning pilgrims without an explicit count number
 
-CRITICAL: Focus on the first 800 characters of the article text. Disallow any explanation or extra context beyond "true"/"false".
+CRITICAL: Focus on the first {token_budget} tokens of the article text. Disallow any explanation or extra context beyond "true"/"false".
 
 Title: {title}
 Article text: {article_text}
@@ -34,7 +34,7 @@ Return a single JSON object with keys "day", "pilgrim_count", and "other_metrics
 - If a field is missing, use null (day), 0 (pilgrim_count), or {{}} (other_metrics).
 
 ### INPUT
-Article text (first 800 chars): {article_text}
+Article text (first {token_budget} tokens): {article_text}
 
 Return the JSON object now.
 '''
