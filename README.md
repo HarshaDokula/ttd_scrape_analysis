@@ -48,9 +48,9 @@ To retry processing previously failed records:
 python process_articles.py <path_to_csv_directory> --retry-failed <failed_records.csv>
 ```
 
-### Path A: Token-Aware Rate Limit Management
+### Token-Aware Rate Limit Management
 
-The pipeline now uses **tiktoken** for exact token counting and intelligent rate-limit management. Instead of the old hard 800-character truncation, article content is truncated to a **token budget** (default 4096 tokens/request, ~16K chars).
+The pipeline uses **tiktoken** for exact token counting and intelligent rate-limit management. Article content is truncated to a **token budget** (default 4096 tokens/request, ~16K chars) instead of a hard character limit.
 
 Key CLI arguments for tuning:
 
@@ -62,7 +62,7 @@ Key CLI arguments for tuning:
 | `--tpm-pace-threshold` | 0.75 | Fraction of TPM at which to start pacing submissions (default: 75%). |
 | `--per-batch-timeout` | 3600 | Seconds before giving up on a stuck batch. Higher values (60+ min) help when batches are queued behind TPM limits. |
 
-Example with custom Path A settings:
+Example with custom settings:
 
 ```bash
 python process_articles.py ../ttd_scrape/scraped_data \
@@ -140,7 +140,7 @@ Example safe workflow to stop a run:
    ```
 3. If needed, inspect and cancel in-progress batches in OpenAI with `cancel_all_batches.py`.
 
-## Rate limit management (Path A)
+## Rate limit management
 
 ### Three rate limit layers
 

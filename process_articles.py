@@ -73,7 +73,7 @@ RPD_WARN_THRESHOLD = 0.85   # start logging warnings at 85%
 RPD_PACE_THRESHOLD = 0.90   # start adding extra delay at 90%
 RPD_HARD_STOP = 0.98        # stop and warn if we somehow exceed 98%
 
-# Path A: TPM tracking defaults
+# TPM tracking defaults
 DEFAULT_TPM_LIMIT = 2_000_000
 DEFAULT_TPM_PACE_THRESHOLD = 0.75
 DEFAULT_MAX_TOKENS_PER_REQUEST = 4096
@@ -175,7 +175,7 @@ class BatchProcessor:
         max_retries: int = 3,
         max_inflight_batches: int = 10,
         state_path: Optional[Path] = None,
-        # ── Path A parameters ──────────────────────────────────────────────
+        # ── Token-aware parameters ─────────────────────────────────────────
         max_tokens_per_request: int = DEFAULT_MAX_TOKENS_PER_REQUEST,
         max_tokens_per_batch: int = DEFAULT_MAX_TOKENS_PER_BATCH,
         tpm_limit: int = DEFAULT_TPM_LIMIT,
@@ -196,7 +196,7 @@ class BatchProcessor:
         self.max_retries = max_retries
         self.max_inflight_batches = max_inflight_batches
 
-        # Path A: token budget and TPM tracking
+        # Token budget and TPM tracking
         self.max_tokens_per_request = max_tokens_per_request
         self.max_tokens_per_batch = max_tokens_per_batch
         self.tpm_tracker = TPMSlidingWindow(
@@ -828,7 +828,7 @@ class BatchProcessor:
     def submit_classification_batches(self) -> List[str]:
         """Submit all loaded articles for classification in batches.
 
-        Uses token-budget-aware batching (Path A) instead of fixed-size
+        Uses token-budget-aware batching instead of fixed-size
         batches. Each batch is sized to stay within ``max_tokens_per_batch``.
         """
 
@@ -847,7 +847,7 @@ class BatchProcessor:
 
         active_batches: List[str] = []
 
-        # Path A: token-budget-based batching
+        # Token-budget-based batching
         for batch in self._chunk_by_token_budget(articles_list, "classification"):
             items = [
                 {
@@ -888,7 +888,7 @@ class BatchProcessor:
                     batch_tokens,
                 )
 
-                # Path A: TPM + inflight-aware throttle before next submission
+                # TPM + inflight-aware throttle before next classification submission
                 self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
 
             except Exception as exc:  # network/API errors; logged + mark failed
@@ -988,7 +988,7 @@ class BatchProcessor:
     def submit_extraction_batches(self, article_ids: List[str]) -> List[str]:
         """Submit classified-TRUE articles for metric extraction.
 
-        Uses token-budget-aware batching (Path A).
+        Uses token-budget-aware batching.
         """
 
         logger.info(
@@ -1054,7 +1054,7 @@ class BatchProcessor:
                     batch_tokens,
                 )
 
-                # Path A: TPM + inflight-aware throttle before next submission
+                # TPM + inflight-aware throttle before next extraction submission
                 self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
 
             except Exception as exc:
@@ -1252,7 +1252,7 @@ class BatchProcessor:
         of the batch API. The method updates :attr:`darshan_rows`,
         :attr:`failed_records`, and :attr:`metrics` in-place.
 
-        Path A: Uses tiktoken for exact content truncation (via the provider)
+        Uses tiktoken for exact content truncation (via the provider)
         and the TPM sliding-window tracker to pace request throughput against
         the organization-level tokens-per-minute limit.
         """
@@ -1283,7 +1283,7 @@ class BatchProcessor:
             if pace_delay > 0:
                 time.sleep(pace_delay)
 
-            # Path A: TPM-aware wait before the request
+            # TPM-aware wait before the request
             self.tpm_tracker.wait_until_ready(est_tokens, max_wait_sec=300.0)
 
             for attempt in range(1, self.max_retries + 1):
@@ -1341,7 +1341,7 @@ class BatchProcessor:
             if pace_delay > 0:
                 time.sleep(pace_delay)
 
-            # Path A: TPM-aware wait before extraction request
+            # TPM-aware wait before extraction request
             est_extract_tokens = self._estimate_request_tokens(article, "extraction")
             self.tpm_tracker.wait_until_ready(est_extract_tokens, max_wait_sec=300.0)
 
@@ -1592,7 +1592,7 @@ class BatchProcessor:
             )
             logger.info("Overall success rate:       %.1f%%", success_rate)
         logger.info("=" * 60)
-        logger.info("Path A TPM tracking:")
+        logger.info("TPM tracking:")
         self.tpm_tracker.log_snapshot(label="final")
         logger.info("=" * 60)
 
@@ -1665,7 +1665,7 @@ def main() -> None:
         help="Process each article synchronously (one-by-one) instead of using batch API",
     )
 
-    # ── Path A arguments ──────────────────────────────────────────────────
+    # ── Token-aware arguments ─────────────────────────────────────────────
     parser.add_argument(
         "--max-tokens-per-request",
         type=int,
@@ -1735,7 +1735,7 @@ def main() -> None:
         max_retries=args.max_retries,
         max_inflight_batches=args.max_inflight_batches,
         state_path=Path(args.state_file) if args.state_file else None,
-        # ── Path A ────────────────────────────────────────────────────────
+        # ── Token-aware parameters ────────────────────────────────────────
         max_tokens_per_request=args.max_tokens_per_request,
         max_tokens_per_batch=args.max_tokens_per_batch,
         tpm_limit=args.tpm_limit,
