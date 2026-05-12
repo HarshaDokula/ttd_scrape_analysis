@@ -1251,6 +1251,10 @@ class BatchProcessor:
         and, if relevant, extracted via direct OpenAI completion calls instead
         of the batch API. The method updates :attr:`darshan_rows`,
         :attr:`failed_records`, and :attr:`metrics` in-place.
+
+        Path A: Uses tiktoken for exact content truncation (via the provider)
+        and the TPM sliding-window tracker to pace request throughput against
+        the organization-level tokens-per-minute limit.
         """
 
         logger.info("Per-record mode enabled: processing articles one-by-one")
@@ -1268,6 +1272,9 @@ class BatchProcessor:
             if not article_id:
                 continue
 
+            # Estimate tokens for this request (for TPM pacing)
+            est_tokens = self._estimate_request_tokens(article, "classification")
+
             classification: Optional[str] = None
             classification_failed = False
 
@@ -1275,6 +1282,9 @@ class BatchProcessor:
             pace_delay = self._check_rate_limit()
             if pace_delay > 0:
                 time.sleep(pace_delay)
+
+            # Path A: TPM-aware wait before the request
+            self.tpm_tracker.wait_until_ready(est_tokens, max_wait_sec=300.0)
 
             for attempt in range(1, self.max_retries + 1):
                 try:
@@ -1330,6 +1340,10 @@ class BatchProcessor:
             pace_delay = self._check_rate_limit()
             if pace_delay > 0:
                 time.sleep(pace_delay)
+
+            # Path A: TPM-aware wait before extraction request
+            est_extract_tokens = self._estimate_request_tokens(article, "extraction")
+            self.tpm_tracker.wait_until_ready(est_extract_tokens, max_wait_sec=300.0)
 
             for attempt in range(1, self.max_retries + 1):
                 try:
