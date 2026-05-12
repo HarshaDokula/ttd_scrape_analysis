@@ -758,13 +758,13 @@ class BatchProcessor:
 
                 # Non-terminal state (e.g. validating/in_progress/finalizing)
                 elapsed = time.time() - start_times[batch_id]
-                if elapsed > per_batch_timeout_sec:
+                if elapsed > self.per_batch_timeout_sec:
                     logger.error(
                         "%s batch %s did not reach terminal status within %d seconds; "
                         "treating as failed",
                         pretty_kind,
                         batch_id,
-                        per_batch_timeout_sec,
+                        self.per_batch_timeout_sec,
                     )
                     status_with_timeout = dict(status)
                     status_with_timeout["status"] = "timeout"
