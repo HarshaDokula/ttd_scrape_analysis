@@ -60,7 +60,7 @@ Key CLI arguments for tuning:
 | `--max-tokens-per-batch` | 1,500,000 | Max tokens per batch file (25% headroom under OpenAI's 2M per-batch limit). Batches are dynamically sized to fit this budget. |
 | `--tpm-limit` | 2,000,000 | Organization TPM (tokens per minute) limit. Used to pace batch submissions. |
 | `--tpm-pace-threshold` | 0.75 | Fraction of TPM at which to start pacing submissions (default: 75%). |
-| `--per-batch-timeout` | 3600 | Seconds before giving up on a stuck batch. Higher values (60+ min) help when batches are queued behind TPM limits. |
+| `--per-batch-timeout` | 86400 | Seconds before giving up on a batch (default 24h, matches OpenAI's completion window). Batches at `processed=0` are usually just queued — increase this rather than cancelling. |
 
 Example with custom settings:
 

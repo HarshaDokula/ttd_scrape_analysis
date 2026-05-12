@@ -78,7 +78,7 @@ DEFAULT_TPM_LIMIT = 2_000_000
 DEFAULT_TPM_PACE_THRESHOLD = 0.75
 DEFAULT_MAX_TOKENS_PER_REQUEST = 4096
 DEFAULT_MAX_TOKENS_PER_BATCH = 1_500_000  # 25% under OpenAI's 2M per-batch limit
-DEFAULT_PER_BATCH_TIMEOUT_SEC = 3600  # 60 minutes (was 15)
+DEFAULT_PER_BATCH_TIMEOUT_SEC = 86400  # 24 hours (matches OpenAI's completion window)
 
 
 # ---------------------------
