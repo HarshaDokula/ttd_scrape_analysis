@@ -33,8 +33,12 @@ _RUN_LABEL: str = ""
 from prompt_templates import ttd_prompt_tmpl3, ttd_info_extract_prompt_tmpl_v2  # noqa: E402
 
 # Extra overhead per request beyond the formatted prompt text — accounts for
-# JSON body framing (model, temperature, max_tokens, stop, etc.).
-_JSON_BODY_OVERHEAD_TOKENS = 25
+# the JSON body framing that wraps each request in the JSONL file:
+#   {"custom_id":"...","method":"POST","url":"/v1/chat/completions",
+#    "body":{"model":"...","messages":[...],"temperature":...,
+#            "max_tokens":...}}
+# Measured via tiktoken on the actual framing text.
+_JSON_BODY_OVERHEAD_TOKENS = 75
 
 
 def _generate_run_label() -> str:
@@ -752,16 +756,35 @@ class BatchProcessor:
 
         When inflight batches reach terminal state, their estimated tokens are
         freed from the enqueued counter.
+
+        **Timeout & backoff**: Batches that stay non-terminal longer than
+        ``per_batch_timeout_sec`` are treated as failed and removed so
+        submission progress is not permanently blocked by a stuck batch.
+        Polling frequency decays exponentially when no batch makes progress.
         """
 
         if self.max_inflight_batches <= 0 and pending_tokens <= 0:
             return
 
-        interval = getattr(self.provider, "poll_interval", 10)
+        min_interval = max(10, getattr(self.provider, "poll_interval", 10))
+        max_interval = 3600
+        current_interval = float(min_interval)
+        backoff_factor = 2.0
         tpm_warning_logged = False
         enqueued_warning_logged = False
 
+        # Track per-batch start times and last-processed counts for timeout
+        # and progress detection.
+        batch_start: Dict[str, float] = {
+            bid: time.time() for bid in active_batch_ids
+        }
+        last_processed: Dict[str, int] = {bid: -1 for bid in active_batch_ids}
+        tick = 0
+
         while True:
+            tick += 1
+            made_progress = False
+
             # --- Condition 1: poll inflight batches, free enqueued tokens ---
             if active_batch_ids:
                 for batch_id in list(active_batch_ids):
@@ -776,9 +799,50 @@ class BatchProcessor:
                         continue
 
                     state = status.get("status")
+                    processed = int(status.get("processed") or 0)
+
+                    if processed != last_processed.get(batch_id, -1):
+                        last_processed[batch_id] = processed
+                        made_progress = True
+
                     if state in {"completed", "failed", "expired"}:
                         self._subtract_enqueued_tokens(batch_id)
                         active_batch_ids.remove(batch_id)
+                        made_progress = True
+                        continue
+
+                    # --- Per-batch timeout: treat as failed (batch expired on OpenAI) ---
+                    elapsed = time.time() - batch_start.get(batch_id, time.time())
+                    if elapsed > self.per_batch_timeout_sec:
+                        logger.error(
+                            "Batch %s stuck %s for %.0fs (timeout=%ds); "
+                            "treating as failed",
+                            batch_id,
+                            state,
+                            elapsed,
+                            self.per_batch_timeout_sec,
+                        )
+                        self._subtract_enqueued_tokens(batch_id)
+                        self._mark_batch_failed(
+                            batch_id, reason=f"stuck in {state} for {elapsed:.0f}s"
+                        )
+                        active_batch_ids.remove(batch_id)
+                        try:
+                            errors = self.provider.get_batch_errors(batch_id)
+                            self._parse_enqueued_limit_from_errors(errors)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        made_progress = True
+                        continue
+
+                    if tick == 1 or (tick % 10 == 0):
+                        logger.info(
+                            "Batch %s status=%s (processed=%s) elapsed=%.0fs",
+                            batch_id,
+                            state,
+                            processed,
+                            elapsed,
+                        )
 
             # --- Condition 2: enqueued token budget ---
             enqueued_budget = int(self.max_enqueued_tokens * self.enqueued_pace_threshold)
@@ -794,7 +858,7 @@ class BatchProcessor:
                         enqueued_budget,
                     )
                     enqueued_warning_logged = True
-                time.sleep(interval)
+                time.sleep(current_interval)
                 continue
 
             # --- Condition 3: TPM budget available ---
@@ -802,7 +866,7 @@ class BatchProcessor:
                 if not tpm_warning_logged:
                     self.tpm_tracker.log_snapshot(label="waiting for TPM budget")
                     tpm_warning_logged = True
-                time.sleep(interval)
+                time.sleep(current_interval)
                 continue
 
             # --- All conditions met? ---
@@ -822,7 +886,24 @@ class BatchProcessor:
                         )
                         return
 
-            time.sleep(interval)
+            # Adaptive polling: reset to minimum when batches make progress,
+            # back off exponentially when stuck (up to 1 hour).
+            if made_progress:
+                current_interval = float(min_interval)
+            else:
+                current_interval = min(max_interval, current_interval * backoff_factor)
+
+            try:
+                import random
+                jitter = current_interval * 0.1
+                sleep_time = current_interval + random.uniform(-jitter, jitter)
+            except Exception:
+                sleep_time = current_interval
+
+            if sleep_time < min_interval:
+                sleep_time = min_interval
+
+            time.sleep(sleep_time)
 
     def _get_batch_article_ids(self, batch_id: str) -> List[str]:
         """Return the article_ids recorded for a given batch_id, if any."""
