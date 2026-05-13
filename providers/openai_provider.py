@@ -68,6 +68,7 @@ class OpenAIProvider(BaseProvider):
         model: Optional[str] = None,
         completion_window: Optional[str] = None,
         max_tokens_per_request: int = 4096,
+        admin_api_key: Optional[str] = None,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.max_tokens_per_request = max_tokens_per_request
@@ -84,6 +85,12 @@ class OpenAIProvider(BaseProvider):
         self.client = OpenAI(api_key=self.api_key, max_retries=0)
         self.poll_interval = 10
         self.max_poll_attempts = 1440
+
+        # Optional admin client for org-level usage queries
+        admin_key = admin_api_key or os.getenv("OPENAI_ADMIN_KEY")
+        self._admin_client: Optional[OpenAI] = (
+            OpenAI(api_key=admin_key, max_retries=0) if admin_key else None
+        )
 
         self._result_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._error_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -504,6 +511,126 @@ class OpenAIProvider(BaseProvider):
             text = text[: -3]
 
         return text.strip()
+
+    def fetch_non_terminal_batches(
+        self,
+        page_size: int = 100,
+        max_pages: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List batches in non-terminal states and estimate their enqueued tokens.
+
+        Queries OpenAI's batch list API for batches with status
+        ``validating``, ``in_progress``, or ``finalizing`` and returns
+        metadata plus an estimated token count per batch using the
+        provider's own ``max_tokens_per_request`` as an upper bound.
+
+        This lets the caller seed the local enqueued-token counter at
+        startup so new submissions don't accidentally exceed the org
+        limit because of previously-submitted batches.
+
+        Args:
+            page_size: Number of items per page.
+            max_pages: Safety cap on pages to fetch.
+
+        Returns:
+            A list of dicts with keys ``batch_id``, ``status``,
+            ``request_count``, ``estimated_tokens``, and ``created_at``.
+        """
+
+        non_terminal: List[Dict[str, Any]] = []
+
+        for status in ("validating", "in_progress", "finalizing"):
+            try:
+                batches = self.list_batches(status=status, page_size=page_size, max_pages=max_pages)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to list batches with status %r (non-fatal): %s",
+                    status,
+                    exc,
+                )
+                continue
+
+            for batch in batches:
+                bid = getattr(batch, "id", None) or ""
+                bstatus = getattr(batch, "status", "") or ""
+                rc = getattr(batch, "request_counts", None)
+                total_reqs = getattr(rc, "total", 0) if rc else 0
+                created = getattr(batch, "created_at", None)
+
+                # Estimate: each request is capped at max_tokens_per_request tokens
+                estimated = total_reqs * self.max_tokens_per_request
+
+                non_terminal.append(
+                    {
+                        "batch_id": bid,
+                        "status": bstatus,
+                        "request_count": total_reqs,
+                        "estimated_tokens": estimated,
+                        "created_at": created,
+                    }
+                )
+
+        # Sort by creation time (oldest first)
+        non_terminal.sort(key=lambda b: b.get("created_at") or 0)
+
+        if non_terminal:
+            total_est = sum(b["estimated_tokens"] for b in non_terminal)
+            logger.warning(
+                "Found %d non-terminal batches (~%d estimated enqueued tokens): %s",
+                len(non_terminal),
+                total_est,
+                ", ".join(f"{b['batch_id']}({b['status']})" for b in non_terminal),
+            )
+
+        return non_terminal
+
+    def fetch_recent_tpm_usage(self, minutes: int = 1) -> int:
+        """Query the Admin Usage Completions API for recent token consumption.
+
+        Uses the SDK's :meth:`openai.resources.admin.organization.usage.Completions.list`
+        which requires an API key with ``organization.admin`` role, passed as
+        ``admin_api_key`` to the constructor or set via the ``OPENAI_ADMIN_KEY``
+        environment variable.
+
+        Returns the total *input* tokens consumed in the last *minutes*
+        minutes, or 0 if the admin client is not configured or the API call
+        fails.
+        """
+
+        if not self._admin_client:
+            logger.info(
+                "Admin Usage API not available: no OPENAI_ADMIN_KEY configured"
+            )
+            return 0
+
+        end_time = int(time.time())
+        start_time = end_time - (minutes * 60)
+
+        try:
+            response = self._admin_client.admin.organization.usage.completions(
+                start_time=start_time,
+            )
+            data = getattr(response, "data", None) or []
+
+            total = 0
+            for bucket in data:
+                results = getattr(bucket, "results", None) or []
+                for result in results:
+                    total += getattr(result, "input_tokens", 0) or 0
+
+            logger.info(
+                "Admin Usage API: %d input tokens consumed in last %d min(s)",
+                total,
+                minutes,
+            )
+            return total
+
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "Admin Usage API unavailable (non-fatal, continuing with defaults): %s",
+                exc,
+            )
+            return 0
 
     def _download_file(self, file_id: str) -> List[str]:
         file_content = self.client.files.content(file_id)

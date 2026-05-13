@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from provider_factory import get_provider
+from providers.openai_provider import OpenAIProvider
 
 load_dotenv()
 
@@ -278,6 +279,71 @@ class BatchProcessor:
         # Rate-limit tracking: total requests made in this session
         self._total_requests: int = 0
         self._last_rpd_warning_pct: float = 0.0
+
+        # Sync with OpenAI's actual enqueued state at startup
+        self._sync_enqueued_state()
+
+    # -----------------------
+    # Startup State Sync
+    # -----------------------
+
+    def _sync_enqueued_state(self) -> None:
+        """Seed local rate-limit counters from OpenAI's actual state.
+
+        Queries the API for:
+
+        1. **Non-terminal batches** (validating / in_progress / finalizing)
+           from prior runs. Their estimated token counts seed
+           ``_enqueued_tokens`` so the local counter reflects the real
+           org-level enqueued load.
+
+        2. **Recent TPM usage** (via the Admin Usage Completions API) to
+           seed the TPM sliding window. This requires an API key with
+           ``organization.admin`` role; if unavailable it logs a notice
+           and continues with an empty window.
+
+        Both queries are best-effort — failures are logged but never
+        fatal, so the processor will work with conservative defaults.
+        """
+
+        if not isinstance(self.provider, OpenAIProvider):
+            return
+
+        # --- Enqueued tokens: list non-terminal batches ---
+        try:
+            batches = self.provider.fetch_non_terminal_batches()
+            total_enqueued = sum(b["estimated_tokens"] for b in batches)
+            if total_enqueued > 0:
+                self._enqueued_tokens = total_enqueued
+                logger.warning(
+                    "Seeded enqueued-token counter from %d existing batch(es): %d tokens",
+                    len(batches),
+                    total_enqueued,
+                )
+            else:
+                logger.info(
+                    "No non-terminal batches found; enqueued counter starts at 0"
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to sync enqueued state from OpenAI (non-fatal): %s", exc
+            )
+
+        # --- TPM: seed from Admin Usage API ---
+        try:
+            recent_tpm = self.provider.fetch_recent_tpm_usage(minutes=1)
+            if recent_tpm > 0:
+                self.tpm_tracker.consume(recent_tpm)
+                logger.info(
+                    "Seeded TPM tracker with %d tokens from Admin Usage API",
+                    recent_tpm,
+                )
+                self.tpm_tracker.log_snapshot(label="after seeding")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to seed TPM tracker from Admin Usage API (non-fatal): %s",
+                exc,
+            )
 
     # -----------------------
     # Data Loading & Caching
