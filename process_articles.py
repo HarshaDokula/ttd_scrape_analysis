@@ -6,7 +6,6 @@ import re
 import sys
 import time
 import signal
-import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,29 +28,20 @@ load_dotenv()
 _RUN_LABEL: str = ""
 
 
-COUNTER_FILE = Path(__file__).parent / ".run_counter"
-_LOCK = threading.Lock()
+def _generate_run_label() -> str:
+    """Generate a unique run label using microsecond-precision timestamp.
 
-
-def _next_run_number() -> int:
-    """Read, increment, and persist a run counter. Thread-safe."""
-    with _LOCK:
-        if COUNTER_FILE.exists():
-            num = int(COUNTER_FILE.read_text().strip())
-        else:
-            num = 0
-        num += 1
-        COUNTER_FILE.write_text(str(num))
-        return num
+    Microsecond granularity avoids the need for a persisted counter file
+    that would have to be committed to the repo after every run.
+    """
+    return datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')
 
 
 def setup_logger() -> logging.Logger:
     global _RUN_LABEL
     logs_path = Path("logs")
     logs_path.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    run_num = _next_run_number()
-    _RUN_LABEL = f"{timestamp}_{run_num:03d}"
+    _RUN_LABEL = _generate_run_label()
     log_filename = logs_path / f"log_{_RUN_LABEL}.log"
 
     logging.basicConfig(
@@ -1033,6 +1023,10 @@ class BatchProcessor:
             batch_tokens = self._estimate_batch_tokens(batch, "classification")
 
             try:
+                # TPM + inflight + enqueued budget check **before** submission to
+                # avoid hitting the org-level enqueued token limit.
+                self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
+
                 requests_jsonl = self.provider.build_batch_requests(
                     "classification", items
                 )
@@ -1059,11 +1053,15 @@ class BatchProcessor:
                     batch_tokens,
                 )
 
-                # TPM + inflight-aware throttle before next classification submission
-                self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
-
             except Exception as exc:  # network/API errors; logged + mark failed
-                logger.error("Error submitting classification batch: %s", exc)
+                # Revert the tokens that were already consumed by
+                # _throttle_inflight_and_tpm so future batches don't under-count.
+                self._enqueued_tokens = max(0, self._enqueued_tokens - batch_tokens)
+                logger.error(
+                    "Error submitting classification batch (~%d tokens): %s",
+                    batch_tokens,
+                    exc,
+                )
                 for art in batch:
                     self.failed_records.append(art["row"])
 
@@ -1199,6 +1197,10 @@ class BatchProcessor:
             batch_tokens = self._estimate_batch_tokens(batch, "extraction")
 
             try:
+                # TPM + inflight + enqueued budget check **before** submission to
+                # avoid hitting the org-level enqueued token limit.
+                self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
+
                 requests_jsonl = self.provider.build_batch_requests(
                     "extraction", batch_items
                 )
@@ -1225,11 +1227,15 @@ class BatchProcessor:
                     batch_tokens,
                 )
 
-                # TPM + inflight-aware throttle before next extraction submission
-                self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
-
             except Exception as exc:
-                logger.error("Error submitting extraction batch: %s", exc)
+                # Revert the tokens that were already consumed by
+                # _throttle_inflight_and_tpm so future batches don't under-count.
+                self._enqueued_tokens = max(0, self._enqueued_tokens - batch_tokens)
+                logger.error(
+                    "Error submitting extraction batch (~%d tokens): %s",
+                    batch_tokens,
+                    exc,
+                )
 
         return batch_ids
 

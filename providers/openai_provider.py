@@ -421,11 +421,13 @@ class OpenAIProvider(BaseProvider):
     ) -> List[Any]:
         """List batches from OpenAI's `/v1/batches` endpoint.
 
-        This is a thin wrapper around ``client.batches.list`` that handles
-        pagination for you, returning a flat list of batch objects.
+        Paginates through the API and optionally filters results by status
+        **client-side** because the current OpenAI SDK does not expose a
+        ``status`` query parameter on ``batches.list``.
 
         Args:
-            status: Optional status filter (e.g. "validating", "completed").
+            status: Optional status filter applied client-side (e.g.
+                "validating", "completed").
             page_size: Number of items to request per page (``limit``).
             max_pages: Safety cap on the number of pages to fetch.
 
@@ -441,8 +443,6 @@ class OpenAIProvider(BaseProvider):
             kwargs: Dict[str, Any] = {"limit": page_size}
             if after is not None:
                 kwargs["after"] = after
-            if status is not None:
-                kwargs["status"] = status
 
             resp = self.client.batches.list(**kwargs)
             page = list(getattr(resp, "data", []) or [])
@@ -460,6 +460,11 @@ class OpenAIProvider(BaseProvider):
             after = getattr(last, "id", None)
             if after is None:
                 break
+
+        # Client-side status filter (the SDK's batche s.list() doesn't accept
+        # a ``status`` parameter in the current version).
+        if status is not None:
+            all_batches = [b for b in all_batches if getattr(b, "status", None) == status]
 
         return all_batches
 
