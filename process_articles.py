@@ -2,9 +2,11 @@ import argparse
 import csv
 import json
 import logging
+import re
 import sys
 import time
 import signal
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -26,55 +28,20 @@ load_dotenv()
 _RUN_LABEL: str = ""
 
 
-def _random_run_name() -> str:
-    """Generate a Docker-style random name: adjective_noun."""
-    import random
+COUNTER_FILE = Path(__file__).parent / ".run_counter"
+_LOCK = threading.Lock()
 
-    adjectives = [
-        "admiring", "adoring", "agitated", "amazing", "angry", "awesome",
-        "blissful", "bold", "brave", "calm", "charming", "clever",
-        "compassionate", "confident", "cool", "cranky", "crazy", "dazzling",
-        "determined", "distracted", "dreamy", "eager", "ecstatic", "elastic",
-        "elated", "elegant", "eloquent", "epic", "fervent", "festive",
-        "flamboyant", "focused", "friendly", "frosty", "gallant", "gifted",
-        "goofy", "gracious", "happy", "hardcore", "hopeful", "hungry",
-        "inspiring", "jolly", "jovial", "keen", "kind", "laughing",
-        "loving", "lucid", "magical", "mighty", "musing", "nervous",
-        "nice", "nifty", "nostalgic", "optimistic", "peaceful", "pensive",
-        "practical", "priceless", "quirky", "quizzical", "recursing",
-        "relaxed", "reverent", "romantic", "sad", "serene", "sharp",
-        "silly", "sleepy", "stoic", "stupefied", "suspicious", "tender",
-        "thirsty", "trusting", "unruffled", "upbeat", "vibrant", "vigilant",
-        "vivid", "wizardly", "wonderful", "youthful", "zealous", "zen",
-    ]
-    nouns = [
-        "albattani", "almeida", "ardinghelli", "babbage", "banach",
-        "bardeen", "bartik", "bassi", "bell", "blackwell", "bohr",
-        "booth", "borg", "bose", "boyd", "brahmagupta", "brattain",
-        "brown", "carson", "chandrasekhar", "chebyshev", "clarke",
-        "cori", "cray", "curie", "davinci", "dijkstra", "dubinsky",
-        "easley", "einstein", "elion", "engelbart", "euclid", "euler",
-        "fermat", "fermi", "feynman", "franklin", "galileo", "gates",
-        "goldberg", "goldstine", "goodall", "hamilton", "hawking",
-        "heisenberg", "hermann", "hinton", "hopper", "hugle", "jones",
-        "jordan", "kalam", "keller", "kepler", "kilby", "khorana",
-        "kirch", "knuth", "kowalevski", "lalande", "lamarr", "leakey",
-        "leavitt", "lichterman", "liskov", "lovelace", "lumiere",
-        "mahavira", "mayer", "mccarthy", "mcclintock", "mclean",
-        "mcnulty", "meitner", "meninsky", "mestorf", "minsky",
-        "mirzakhani", "moore", "morse", "murdock", "neumann",
-        "newton", "nightingale", "nobel", "noether", "northcutt",
-        "noyce", "panini", "pare", "pasteur", "payne", "perlman",
-        "pike", "poincare", "poitras", "ptolemy", "raman", "ramanujan",
-        "ride", "ritchie", "roentgen", "rosalind", "saha", "sammet",
-        "shaw", "shirley", "shockley", "sinoussi", "snyder", "spence",
-        "stallman", "stonebraker", "swanson", "swirles", "taussig",
-        "tereshkova", "tesla", "thompson", "torvalds", "turing",
-        "varahamihira", "visvesvaraya", "volhard", "wescoff", "wiles",
-        "williams", "wilson", "wing", "wozniak", "wright", "yalow",
-        "yonath", "zhukovsky",
-    ]
-    return f"{random.choice(adjectives)}_{random.choice(nouns)}"
+
+def _next_run_number() -> int:
+    """Read, increment, and persist a run counter. Thread-safe."""
+    with _LOCK:
+        if COUNTER_FILE.exists():
+            num = int(COUNTER_FILE.read_text().strip())
+        else:
+            num = 0
+        num += 1
+        COUNTER_FILE.write_text(str(num))
+        return num
 
 
 def setup_logger() -> logging.Logger:
@@ -82,8 +49,8 @@ def setup_logger() -> logging.Logger:
     logs_path = Path("logs")
     logs_path.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    run_name = _random_run_name()
-    _RUN_LABEL = f"{timestamp}_{run_name}"
+    run_num = _next_run_number()
+    _RUN_LABEL = f"{timestamp}_{run_num:03d}"
     log_filename = logs_path / f"log_{_RUN_LABEL}.log"
 
     logging.basicConfig(
@@ -632,6 +599,31 @@ class BatchProcessor:
             self._estimate_request_tokens(item, kind) for item in items
         )
 
+    def _parse_enqueued_limit_from_errors(self, errors: List[Dict[str, Any]]) -> None:
+        """Update max_enqueued_tokens from 'token_limit_exceeded' error messages.
+
+        OpenAI's error messages include the actual limit, e.g.:
+          "Enqueued token limit reached ... Limit: 2,000,000 enqueued tokens"
+        We parse this and adjust our internal limit so we don't hit it again.
+        """
+        for err in errors:
+            msg = err.get("message", "") if isinstance(err, dict) else str(err)
+            match = re.search(r"Limit:\s*([\d,]+)\s+enqueued", msg)
+            if match:
+                discovered = int(match.group(1).replace(",", ""))
+                if discovered > 0 and discovered != self.max_enqueued_tokens:
+                    logger.warning(
+                        "Auto-detected enqueued token limit: %d (was %d)",
+                        discovered,
+                        self.max_enqueued_tokens,
+                    )
+                    self.max_enqueued_tokens = discovered
+                    # Also clamp current counter to the new limit
+                    self._enqueued_tokens = min(
+                        self._enqueued_tokens,
+                        int(self.max_enqueued_tokens * self.enqueued_pace_threshold),
+                    )
+
     def _subtract_enqueued_tokens(self, batch_id: str) -> None:
         """Subtract a batch's estimated tokens from the enqueued counter."""
         for batch in self.pending_batches:
@@ -844,6 +836,7 @@ class BatchProcessor:
                         # Fetch and log batch-level errors for non-successful batches.
                         try:
                             errors = self.provider.get_batch_errors(batch_id)
+                            self._parse_enqueued_limit_from_errors(errors)
                             for error in errors:
                                 logger.error(
                                     "%s batch %s error: %s",
@@ -883,6 +876,7 @@ class BatchProcessor:
                     outstanding.remove(batch_id)
                     try:
                         errors = self.provider.get_batch_errors(batch_id)
+                        self._parse_enqueued_limit_from_errors(errors)
                         for error in errors:
                             logger.error(
                                 "%s batch %s error (on timeout): %s",
@@ -1763,7 +1757,7 @@ def main() -> None:
         default=None,
         help=(
             "Optional path for saving incremental processing state "
-            "(defaults to output/run_<timestamp>_<name>/darshan_state.json)"
+            "(defaults to output/run_<timestamp>_<NNN>/darshan_state.json)"
         ),
     )
     parser.add_argument(
