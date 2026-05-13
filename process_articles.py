@@ -27,6 +27,15 @@ load_dotenv()
 
 _RUN_LABEL: str = ""
 
+# Prompt templates used for token estimation (imported directly rather than
+# going through the provider so _estimate_request_tokens can build the exact
+# prompt text that will be sent).
+from prompt_templates import ttd_prompt_tmpl3, ttd_info_extract_prompt_tmpl_v2  # noqa: E402
+
+# Extra overhead per request beyond the formatted prompt text — accounts for
+# JSON body framing (model, temperature, max_tokens, stop, etc.).
+_JSON_BODY_OVERHEAD_TOKENS = 25
+
 
 def _generate_run_label() -> str:
     """Generate a unique run label using microsecond-precision timestamp.
@@ -431,16 +440,50 @@ class BatchProcessor:
     def _estimate_request_tokens(self, article: Dict[str, Any], kind: str) -> int:
         """Estimate the token count for a single article request.
 
-        Uses the provider's token counter if available; otherwise falls back
-        to a character-based estimate.
-        """
-        content = article.get("content", "")
-        if hasattr(self.provider, "count_request_tokens"):
-            return self.provider.count_request_tokens(content)
+        Builds the **exact same prompt text** that will be sent to the API and
+        counts tokens in it via the provider's tiktoken-based counter. This
+        accounts for the prompt template, title, and truncated content — not
+        just the raw content tokens.
 
-        # Fallback estimate: prompt overhead (~200 tokens) + content
-        prompt_overhead = 200
-        return prompt_overhead + len(content) // 4
+        The estimate is used for:
+        - Token-budget batching (``_chunk_by_token_budget``)
+        - Enqueued / TPM rate-limit tracking
+
+        A small fixed overhead (``_JSON_BODY_OVERHEAD_TOKENS``) is added for
+        the JSON body framing (model name, temperature, max_tokens, etc.).
+        """
+
+        title = article.get("title", "")
+        content = article.get("content", "")
+
+        # Truncate content the same way the provider will when building the
+        # actual batch request.
+        if hasattr(self.provider, "truncate_content"):
+            truncated = self.provider.truncate_content(content)
+        else:
+            # Fallback char-based truncation
+            max_chars = self.max_tokens_per_request * 4
+            truncated = content[:max_chars] if len(content) > max_chars else content
+
+        if kind == "classification":
+            prompt = ttd_prompt_tmpl3.format(
+                title=title,
+                article_text=truncated,
+                token_budget=self.max_tokens_per_request,
+            )
+        else:
+            prompt = ttd_info_extract_prompt_tmpl_v2.format(
+                article_text=truncated,
+                token_budget=self.max_tokens_per_request,
+            )
+
+        prompt_tokens = 0
+        if hasattr(self.provider, "count_request_tokens"):
+            prompt_tokens = self.provider.count_request_tokens(prompt)
+        else:
+            prompt_tokens = len(prompt) // 4
+
+        return prompt_tokens + _JSON_BODY_OVERHEAD_TOKENS
 
     def _chunk_by_token_budget(
         self,
