@@ -671,6 +671,31 @@ class OpenAIProvider(BaseProvider):
                         return None
         return None
 
+    def cancel_batch(self, batch_id: str) -> bool:
+        """Cancel a batch via the OpenAI API.
+
+        Returns True if the batch was successfully cancelled, False if it
+        was already in a terminal state or the cancel request failed.
+        """
+        try:
+            cancelled = self.client.batches.cancel(batch_id)
+            status = getattr(cancelled, "status", "unknown")
+            logger.info("Cancelled batch %s (status=%s)", batch_id, status)
+            return True
+        except APIError as exc:
+            http_status = getattr(exc, "http_status", None)
+            # 400 can mean the batch is already terminal
+            if http_status == 400:
+                logger.info(
+                    "Batch %s already in terminal state; no cancel needed", batch_id
+                )
+                return True
+            logger.warning("Failed to cancel batch %s: %s", batch_id, exc)
+            return False
+        except Exception as exc:
+            logger.warning("Failed to cancel batch %s: %s", batch_id, exc)
+            return False
+
     @staticmethod
     def _should_retry(exc: Exception) -> bool:
         if isinstance(exc, APIError):

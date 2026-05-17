@@ -34,8 +34,7 @@ python process_articles.py test_data/some_darshan
 
 This will:
 - Load all CSV files in the directory
-- Classify articles in batches using OpenAI Batch API
-- Extract pilgrim counts and metrics in batches
+- Run the **unified batch pipeline**: classify articles AND extract metrics in a single event loop, with overlapping phases
 - Aggregate data by date
 - Save a consolidated `darshan_data.json` file with metadata
 - Save `failed_records_*.csv` for any problematic articles
@@ -60,7 +59,8 @@ Key CLI arguments for tuning:
 | `--max-tokens-per-batch` | 500,000 | Max tokens per batch file. Smaller batches allow 2-3 to run concurrently within the enqueued token budget, preventing a single stuck batch from blocking the pipeline. |
 | `--tpm-limit` | 2,000,000 | Organization TPM (tokens per minute) limit. Used to pace batch submissions. |
 | `--tpm-pace-threshold` | 0.75 | Fraction of TPM at which to start pacing submissions. |
-| `--per-batch-timeout` | 86400 | Seconds before giving up on a batch (default 24h, matches OpenAI's completion window). Batches at `processed=0` are usually just queued — increase this rather than cancelling. |
+| `--per-batch-timeout` | 86400 | Absolute timeout — seconds before giving up on a batch entirely (default 24h, matches OpenAI's completion window). Batches at `processed=0` are usually just queued — increase this rather than cancelling. |
+| `--batch-stall-timeout` | 3900 | **Stall detection** — seconds without progress after which a batch is cancelled via the API and retried as new batches (default 1h 5m). Prevents a single stuck batch from blocking the pipeline. |
 | `--max-enqueued-tokens` | 2,000,000 | Org-level enqueued token limit (from batch error messages). Total tokens across all non-terminal batches must stay under this. |
 | `--enqueued-pace-threshold` | 0.90 | Fraction of enqueued limit at which to pause submissions. Increased from 0.75 so more batches can coexist in-flight. |
 
@@ -71,7 +71,7 @@ python process_articles.py ../ttd_scrape/scraped_data \
   --max-tokens-per-request 4096 \
   --max-tokens-per-batch 500000 \
   --max-inflight-batches 5 \
-  --per-batch-timeout 86400
+  --batch-stall-timeout 3900
 ```
 
 ### Per-Record Mode
@@ -93,6 +93,55 @@ Logs are saved in the `logs/` directory with timestamped filenames. Each batch s
 - Test with smaller CSV datasets to verify classification and extraction accuracy.
 - Check `darshan_data.json` for output correctness.
 - Monitor `failed_records_*.csv` for any errors and retry if needed.
+
+## How the pipeline works
+
+The pipeline uses a **unified event loop** that handles both classification and extraction in parallel, rather than running them in two sequential phases. Here's the full flow:
+
+1. **Load articles** — reads all CSV files from the data directory.
+
+2. **Split into token-budgeted batches** — articles are grouped into classification batches sized by token count (not article count) using tiktoken.
+
+3. **Submit batches** — classification batches are submitted to the OpenAI Batch API, up to `max_inflight_batches` at a time.
+
+4. **Poll in round-robin** — the event loop polls ALL active batches every ~10 seconds. Both classification and extraction batches share the same inflight slot pool.
+
+5. **Classification completes → feeds extraction** — when a classification batch finishes, its TRUE articles are immediately added to an extraction queue. Extraction batches are submitted from this queue as inflight slots become available.
+
+6. **Stall detection** — if a batch's `processed` count hasn't advanced for `batch_stall_timeout` (default 1h 5m), it is **cancelled via the OpenAI API** and its articles are redistributed into new batches and re-submitted. This frees the inflight slot.
+
+7. **Absolute timeout** — if a batch still hasn't completed after `per_batch_timeout` (default 24h), it's marked as failed and its articles are recorded in `failed_records_*.csv`.
+
+8. **Done** — the loop exits when both classification and extraction queues are empty and no active batches remain.
+
+### Why overlapping phases matter
+
+Old behavior (two-phase):
+```
+[classify batch 1] [classify batch 2] [classify batch 3]  ← all must finish
+                                                              ↓
+                                   [extract on all TRUE articles]  ← blocked until classification is DONE
+```
+
+New behavior (unified):
+```
+[classify batch 1] [classify batch 2] [classify batch 3]
+        ↓                ↓
+[extract batch 1a]  [extract batch 1b]  [classify batch 3...]
+        ↓                                   ↓
+[extract batch 2a]                  [extract batch 3a]
+```
+
+Classification results feed extraction immediately — if batch 3 gets stuck, extraction on batches 1 and 2 is already running.
+
+### How stall detection avoids the 24-hour deadlock
+
+Without stall detection, a batch stuck at `processed=1323` for 16+ minutes would block the pipeline for the full `per_batch_timeout` (24h). With stall detection:
+
+- After **5 minutes** (configurable via `--batch-stall-timeout`) of no progress, the batch is cancelled.
+- Its articles are split into fresh batches and re-submitted.
+- The inflight slot is freed so other work can proceed.
+- If the new batches also stall, they'll be retried again — the process doesn't deadlock.
 
 ## Notes
 
@@ -165,22 +214,24 @@ Instead of grouping articles by a fixed count (`--batch-size 75`), the processor
 
 The old hard 800-character truncation has been replaced by **tiktoken-based token budget truncation**. Article content is truncated to `--max-tokens-per-request` tokens (default 4096, ~16K chars), giving the model ~10× more context while keeping costs predictable.
 
-### Incremental per-batch processing
+### Unified pipeline (overlapping classification + extraction)
 
-Instead of submitting all batches then processing all results (which could yield 0 output if a single batch gets stuck), the processor now submits batches up to `--max-inflight-batches`, polls them round-robin, and **processes each batch's results immediately upon completion**. As slots free up, remaining batches are submitted. This means:
+Instead of running classification and extraction as two sequential phases, the processor now uses a **single event loop** that manages both. Classification batches and extraction batches share the same `max_inflight_batches` pool, polled together in round-robin. As soon as a classification batch completes, its TRUE articles are fed into the extraction queue and submitted as inflight slots free up.
 
-- If 3 out of 4 batches complete successfully, their results are saved even if batch 4 gets stuck.
-- A stuck batch cannot block results from earlier batches.
-- State is persisted after each extraction batch.
+This means:
+- Extraction starts **immediately** on completed classification results — no need to wait for ALL batches.
+- If one classification batch gets stuck, extraction on earlier batches is already running.
+- A stuck batch is detected via `--batch-stall-timeout` (no progress for N seconds), cancelled, and retried as new batches.
 
 ### How to tune for your environment
 
 | Symptom | Tuning |
 |---|---|
 | Batches stuck at `processed=0` for long periods | Increase `--per-batch-timeout` (default 86400s / 24h). Lower `--tpm-pace-threshold` (try 0.5). Check `--tpm-limit` matches your tier. |
-| `token_limit_exceeded` errors | Decrease `--max-inflight-batches` (try 2–3). Decrease `--max-tokens-per-batch` (try 250000). |
+| `token_limit_exceeded` errors | **Proactive enqueued gating** now waits before submitting if the projected enqueued tokens would exceed `max_enqueued_tokens * enqueued_pace_threshold`. If you still see these errors, decrease `--max-inflight-batches` (try 2–3) or decrease `--max-tokens-per-batch` (try 250000). |
 | Too many small batches | Increase `--max-tokens-per-batch` (try 1000000). |
-| Pipeline deadlocked on one stuck batch | Fixed by incremental processing — earlier batches' results are already saved. If the stuck batch times out (24h), remaining articles are marked failed and processing continues. |
+| Pipeline blocked on one stuck batch | **Stall detection** cancels the batch after `--batch-stall-timeout` (default 1h 5m) without progress and retries its articles in new batches. Overlapping phases also mean extraction on completed batches is already running. |
+| Submission failures lose articles | **Re-queue on failure** — if a batch submission fails (e.g. due to rate limits), its articles are re-queued for retry rather than being permanently marked as failed. |
 | Per-record mode hitting rate limits | The TPM tracker also paces per-record requests. Adjust `--tpm-limit` and `--tpm-pace-threshold`. |
 
 Example restart with conservative throttling:

@@ -9,7 +9,7 @@ import signal
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -103,6 +103,7 @@ DEFAULT_TPM_PACE_THRESHOLD = 0.75
 DEFAULT_MAX_TOKENS_PER_REQUEST = 4096
 DEFAULT_MAX_TOKENS_PER_BATCH = 500_000  # small enough that 2-3 fit in enqueued budget concurrently
 DEFAULT_PER_BATCH_TIMEOUT_SEC = 86400  # 24 hours (matches OpenAI's completion window)
+DEFAULT_BATCH_STALL_TIMEOUT_SEC = 3900  # 1 hour 5 min without progress = stuck, cancel + retry
 DEFAULT_MAX_ENQUEUED_TOKENS = 2_000_000  # org-level enqueued (not per-batch) token limit
 DEFAULT_ENQUEUED_PACE_THRESHOLD = 0.90
 
@@ -207,6 +208,7 @@ class BatchProcessor:
         tpm_limit: int = DEFAULT_TPM_LIMIT,
         tpm_pace_threshold: float = DEFAULT_TPM_PACE_THRESHOLD,
         per_batch_timeout_sec: int = DEFAULT_PER_BATCH_TIMEOUT_SEC,
+        batch_stall_timeout_sec: int = DEFAULT_BATCH_STALL_TIMEOUT_SEC,
         max_enqueued_tokens: int = DEFAULT_MAX_ENQUEUED_TOKENS,
         enqueued_pace_threshold: float = DEFAULT_ENQUEUED_PACE_THRESHOLD,
     ) -> None:
@@ -236,6 +238,7 @@ class BatchProcessor:
             pace_threshold=tpm_pace_threshold,
         )
         self.per_batch_timeout_sec = per_batch_timeout_sec
+        self.batch_stall_timeout_sec = batch_stall_timeout_sec
         self.max_enqueued_tokens = max_enqueued_tokens
         self.enqueued_pace_threshold = enqueued_pace_threshold
         self._enqueued_tokens: int = 0  # running total of enqueued tokens
@@ -267,6 +270,8 @@ class BatchProcessor:
 
         # Batch bookkeeping (for logging/persistence)
         self.pending_batches: List[Dict[str, Any]] = []
+        self._freed_token_batches: Set[str] = set()  # track batches whose enqueued tokens were already freed
+        self._marked_failed_batches: Set[str] = set()  # track batches already marked as failed
 
         # Metrics
         self.metrics: Dict[str, int] = {
@@ -728,7 +733,14 @@ class BatchProcessor:
                     )
 
     def _subtract_enqueued_tokens(self, batch_id: str) -> None:
-        """Subtract a batch's estimated tokens from the enqueued counter."""
+        """Subtract a batch's estimated tokens from the enqueued counter.
+
+        Idempotent: tokens for a given batch are freed at most once so that
+        both the throttle function and the main polling loop can safely call
+        this without double-subtracting.
+        """
+        if batch_id in self._freed_token_batches:
+            return
         for batch in self.pending_batches:
             if batch.get("batch_id") == batch_id:
                 tokens = batch.get("estimated_tokens", 0)
@@ -740,6 +752,7 @@ class BatchProcessor:
                         batch_id,
                         self._enqueued_tokens,
                     )
+                self._freed_token_batches.add(batch_id)
                 break
 
     def _throttle_inflight_and_tpm(
@@ -747,19 +760,16 @@ class BatchProcessor:
         active_batch_ids: List[str],
         pending_tokens: int = 0,
     ) -> None:
-        """Block until inflight count and TPM allow submission.
+        """Block until inflight count, TPM, AND enqueued budget allow submission.
 
         Waits until:
         1. ``len(active_batch_ids) < max_inflight_batches``
         2. TPM tracker has room for *pending_tokens*
-
-        The enqueued token budget is NOT checked proactively here.
-        Instead, ``_submit_batch_with_retry`` submits optimistically and
-        handles ``token_limit_exceeded`` errors with exponential backoff,
-        parsing the true limit from the API error message.
+        3. ``_enqueued_tokens + pending_tokens <= max_enqueued_tokens * enqueued_pace_threshold``
 
         When inflight batches reach terminal state, their estimated tokens are
-        freed from the enqueued counter.
+        freed from the enqueued counter. This prevents the
+        ``token_limit_exceeded`` errors that occurred in the old design.
 
         **Timeout & backoff**: Batches that stay non-terminal longer than
         ``per_batch_timeout_sec`` are treated as failed and removed so
@@ -775,6 +785,7 @@ class BatchProcessor:
         current_interval = float(min_interval)
         backoff_factor = 2.0
         tpm_warning_logged = False
+        enqueued_warning_logged = False
 
         # Track per-batch start times and last-processed counts for timeout
         # and progress detection.
@@ -856,7 +867,25 @@ class BatchProcessor:
                             elapsed,
                         )
 
-            # --- Condition 2: TPM budget available ---
+            # --- Condition 2: Enqueued token budget available ---
+            if pending_tokens > 0:
+                projected = self._enqueued_tokens + pending_tokens
+                limit = int(self.max_enqueued_tokens * self.enqueued_pace_threshold)
+                if projected > limit:
+                    if not enqueued_warning_logged:
+                        logger.warning(
+                            "Enqueued tokens %d + %d = %d exceeds threshold %d "
+                            "(limit=%d, pace=%.2f) \u2014 waiting",
+                            self._enqueued_tokens, pending_tokens, projected,
+                            limit, self.max_enqueued_tokens,
+                            self.enqueued_pace_threshold,
+                        )
+                        enqueued_warning_logged = True
+                    time.sleep(current_interval)
+                    continue
+                enqueued_warning_logged = False
+
+            # --- Condition 3: TPM budget available ---
             if pending_tokens > 0 and not self.tpm_tracker.can_consume(pending_tokens):
                 if not tpm_warning_logged:
                     self.tpm_tracker.log_snapshot(label="waiting for TPM budget")
@@ -875,9 +904,10 @@ class BatchProcessor:
                         self.tpm_tracker.log_snapshot(label="after consume")
                         self._enqueued_tokens += pending_tokens
                         logger.info(
-                            "Enqueued tokens: %d / %d",
+                            "Enqueued tokens: %d / %d (%.1f%%)",
                             self._enqueued_tokens,
                             self.max_enqueued_tokens,
+                            self._enqueued_tokens / self.max_enqueued_tokens * 100,
                         )
                         return
 
@@ -914,10 +944,17 @@ class BatchProcessor:
     def _mark_batch_failed(self, batch_id: str, reason: str = "") -> None:
         """Mark all articles in the given batch as failed.
 
+        Idempotent: a given batch is marked at most once so that both the
+        throttle function and the main polling loop can safely call this.
+
         This is used when a batch ends in a non-successful terminal state
         (failed/expired) or when we give up waiting for it due to timeout
         or polling errors.
         """
+
+        if batch_id in self._marked_failed_batches:
+            return
+        self._marked_failed_batches.add(batch_id)
 
         article_ids = self._get_batch_article_ids(batch_id)
         if not article_ids:
@@ -1166,77 +1203,144 @@ class BatchProcessor:
         except Exception as exc:
             logger.error("Error processing extraction batch %s: %s", batch_id, exc)
 
-    def submit_classification_batches(self) -> List[str]:
-        """Submit classification batches and process results incrementally.
+    def run_batch_pipeline(self) -> None:
+        """Run the full classification + extraction pipeline with overlapping phases.
 
-        Submits batches up to ``max_inflight_batches``, polls them
-        round-robin, and processes each batch's results immediately upon
-        completion. Remaining batches are submitted as slots free up.
-        No longer blocks all progress if one batch gets stuck.
+        Unlike the old two-phase design where extraction waited for ALL
+        classification batches to finish, this method uses a single event
+        loop that:
 
-        Returns a list of article_ids classified as TRUE.
+        1. Submits classification batches up to ``max_inflight_batches``.
+        2. As soon as a classification batch completes, its TRUE articles
+           are fed into an extraction queue.
+        3. Extraction batches are submitted from the queue as inflight slots
+           free up (sharing the same pool with classification batches).
+        4. If any batch makes no progress for ``batch_stall_timeout_sec``
+           seconds, it is cancelled via the OpenAI API and its articles are
+           redistributed into NEW batches and re-queued. This prevents a
+           single stuck batch from blocking the pipeline for 24 hours.
+
+        Both batch types share the same ``max_inflight_batches`` pool and
+        the same polling loop. The method returns when all classification
+        AND extraction work is complete or has been retried to exhaustion.
         """
+
+        # ── Prepare queues ────────────────────────────────────────────────
         articles_list = list(self.processed_articles.values())
-        chunks = list(self._chunk_by_token_budget(articles_list, "classification"))
-        all_extract_ids: List[str] = []
+        classify_chunks = list(self._chunk_by_token_budget(articles_list, "classification"))
+        classify_queue: List[List[Dict[str, Any]]] = list(classify_chunks)
+        extract_queue: List[List[Dict[str, Any]]] = []  # populated as classification completes
 
         logger.info(
-            "Classification: %d articles in %d batches "
-            "(max_tokens_per_request=%d, max_tokens_per_batch=%d, "
-            "max_inflight_batches=%d)",
-            len(articles_list), len(chunks),
-            self.max_tokens_per_request,
-            self.max_tokens_per_batch,
+            "Pipeline: %d articles, %d classification batches, "
+            "max_inflight=%d, stall_timeout=%ds",
+            len(articles_list), len(classify_queue),
             self.max_inflight_batches,
+            self.batch_stall_timeout_sec,
         )
 
+        # ── Tracking ──────────────────────────────────────────────────────
         active_batches: List[str] = []
-        submit_queue = list(chunks)
         batch_start: Dict[str, float] = {}
-        last_processed: Dict[str, int] = {}
+        last_processed_count: Dict[str, int] = {}     # last seen "completed" count
+        last_progress_time: Dict[str, float] = {}     # last time count advanced
+        batch_kind: Dict[str, str] = {}               # "classification" | "extraction"
         tick = 0
 
-        while submit_queue or active_batches:
+        def _items_for_batch(batch: List[Dict[str, Any]], kind: str) -> List[Dict[str, Any]]:
+            if kind == "classification":
+                return [
+                    {"article_id": a["article_id"], "title": a["title"], "content": a["content"]}
+                    for a in batch
+                ]
+            return [{"article_id": a["article_id"], "content": a["content"]} for a in batch]
+
+        def _submit_one(batch: List[Dict[str, Any]], kind: str) -> Optional[str]:
+            """Submit one batch. Returns batch_id on success, None on failure."""
+            batch_tokens = self._estimate_batch_tokens(batch, kind)
+            try:
+                # Pass a copy so throttle never mutates the main loop's list,
+                # preventing silent loss of completed-batch results.
+                self._throttle_inflight_and_tpm(list(active_batches), pending_tokens=batch_tokens)
+                items = _items_for_batch(batch, kind)
+                requests_jsonl = self.provider.build_batch_requests(kind, items)
+                batch_id = self.provider.submit_batch(
+                    kind, requests_jsonl, max_retries=self.max_retries
+                )
+                active_batches.append(batch_id)
+                batch_start[batch_id] = time.time()
+                now = time.time()
+                last_processed_count[batch_id] = -1
+                last_progress_time[batch_id] = now
+                batch_kind[batch_id] = kind
+                self.pending_batches.append({
+                    "kind": kind,
+                    "batch_id": batch_id,
+                    "article_ids": [a["article_id"] for a in batch],
+                    "estimated_tokens": batch_tokens,
+                })
+                logger.info(
+                    "Submitted %s batch: %s (%d articles, ~%d tokens)",
+                    kind, batch_id, len(batch), batch_tokens,
+                )
+                return batch_id
+            except Exception as exc:
+                self._enqueued_tokens = max(0, self._enqueued_tokens - batch_tokens)
+                logger.error(
+                    "Error submitting %s batch (~%d tokens): %s"
+                    " \u2014 re-queuing %d articles for retry",
+                    kind, batch_tokens, exc, len(batch),
+                )
+                # Re-queue instead of marking as failed, so transient errors
+                # (e.g. enqueued limit exceeded) don't permanently lose articles.
+                if kind == "classification":
+                    classify_queue.insert(0, batch)
+                else:
+                    extract_queue.insert(0, batch)
+                return None
+
+        def _re_queue_articles(article_ids: List[str], target_queue: str) -> None:
+            """Re-queue a list of article IDs as a new batch in the given queue."""
+            if not article_ids:
+                return
+            kind = target_queue
+            articles = []
+            for aid in article_ids:
+                key = self.article_index.get(aid)
+                if key:
+                    articles.append(self.processed_articles[key])
+            if articles:
+                # Split into chunks that fit within token budget
+                chunks = list(self._chunk_by_token_budget(articles, kind))
+                if target_queue == "classification":
+                    classify_queue.extend(chunks)
+                else:
+                    extract_queue.extend(chunks)
+                logger.info(
+                    "Re-queued %d articles as %d new %s batch(es)",
+                    len(article_ids), len(chunks), kind,
+                )
+
+        # ── Main event loop ───────────────────────────────────────────────
+        while classify_queue or extract_queue or active_batches:
             tick += 1
             made_progress = False
 
-            # --- Submit more batches if capacity available ---
-            while submit_queue and len(active_batches) < self.max_inflight_batches:
-                batch = submit_queue.pop(0)
-                batch_tokens = self._estimate_batch_tokens(batch, "classification")
-                try:
-                    self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
-                    items = [
-                        {"article_id": a["article_id"], "title": a["title"], "content": a["content"]}
-                        for a in batch
-                    ]
-                    requests_jsonl = self.provider.build_batch_requests("classification", items)
-                    batch_id = self.provider.submit_batch(
-                        "classification", requests_jsonl, max_retries=self.max_retries
-                    )
-                    active_batches.append(batch_id)
-                    batch_start[batch_id] = time.time()
-                    last_processed[batch_id] = -1
-                    self.pending_batches.append({
-                        "kind": "classification",
-                        "batch_id": batch_id,
-                        "article_ids": [a["article_id"] for a in batch],
-                        "estimated_tokens": batch_tokens,
-                    })
-                    logger.info(
-                        "Submitted classification batch: %s (%d articles, ~%d tokens)",
-                        batch_id, len(batch), batch_tokens,
-                    )
-                except Exception as exc:
-                    self._enqueued_tokens = max(0, self._enqueued_tokens - batch_tokens)
-                    logger.error("Error submitting classification batch (~%d tokens): %s", batch_tokens, exc)
-                    for art in batch:
-                        self.failed_records.append(art["row"])
+            # --- Submit classification batches ---
+            while classify_queue and len(active_batches) < self.max_inflight_batches:
+                batch = classify_queue.pop(0)
+                _submit_one(batch, "classification")
+
+            # --- Submit extraction batches ---
+            while extract_queue and len(active_batches) < self.max_inflight_batches:
+                batch = extract_queue.pop(0)
+                _submit_one(batch, "extraction")
 
             if not active_batches:
+                # Nothing in-flight and nothing queued — all done
                 break
 
-            # --- Poll all active batches, process completed ones immediately ---
+            # --- Poll all active batches ---
             for batch_id in list(active_batches):
                 try:
                     status = self.provider.get_batch_status(batch_id)
@@ -1244,22 +1348,35 @@ class BatchProcessor:
                     logger.error("Error polling batch %s: %s", batch_id, exc)
                     continue
 
+                kind = batch_kind.get(batch_id, "?")
                 state = status.get("status")
                 processed = int(status.get("processed") or 0)
+                now = time.time()
 
-                if processed != last_processed.get(batch_id, -1):
-                    last_processed[batch_id] = processed
+                # Track progress
+                if processed != last_processed_count.get(batch_id, -1):
+                    last_processed_count[batch_id] = processed
+                    last_progress_time[batch_id] = now
                     made_progress = True
 
+                # ── Terminal states ───────────────────────────────────────
                 if state in {"completed", "failed", "expired"}:
                     self._subtract_enqueued_tokens(batch_id)
                     active_batches.remove(batch_id)
                     made_progress = True
 
                     if state == "completed":
-                        logger.info("Classification batch %s completed \u2014 processing results", batch_id)
-                        batch_results = self._process_classification_batch_results(batch_id)
-                        all_extract_ids.extend(batch_results)
+                        logger.info(
+                            "%s batch %s completed \u2014 processing results",
+                            kind.capitalize(), batch_id,
+                        )
+                        if kind == "classification":
+                            true_ids = self._process_classification_batch_results(batch_id)
+                            if true_ids:
+                                # Feed TRUE articles directly into extraction queue
+                                _re_queue_articles(true_ids, "extraction")
+                        else:
+                            self._process_extraction_batch_results(batch_id)
                     else:
                         self._mark_batch_failed(batch_id, reason=f"terminal status {state}")
 
@@ -1270,10 +1387,13 @@ class BatchProcessor:
                         pass
                     continue
 
-                # --- Timeout check ---
-                elapsed = time.time() - batch_start.get(batch_id, time.time())
+                # ── Absolute timeout (24h default) ────────────────────────
+                elapsed = now - batch_start.get(batch_id, now)
                 if elapsed > self.per_batch_timeout_sec:
-                    logger.error("Classification batch %s timed out after %.0fs", batch_id, elapsed)
+                    logger.error(
+                        "%s batch %s timed out after %.0fs",
+                        kind.capitalize(), batch_id, elapsed,
+                    )
                     self._subtract_enqueued_tokens(batch_id)
                     self._mark_batch_failed(batch_id, reason=f"timeout after {elapsed:.0f}s")
                     active_batches.remove(batch_id)
@@ -1284,148 +1404,47 @@ class BatchProcessor:
                         pass
                     continue
 
+                # ── Stall detection: cancel + retry ───────────────────────
+                stalled_for = now - last_progress_time.get(batch_id, now)
+                if stalled_for > self.batch_stall_timeout_sec and last_processed_count.get(batch_id, -1) >= 0:
+                    article_ids = self._get_batch_article_ids(batch_id)
+                    logger.warning(
+                        "%s batch %s stalled at processed=%d for %.0fs (stall_timeout=%ds) "
+                        "\u2014 cancelling and retrying %d articles",
+                        kind.capitalize(), batch_id, processed, stalled_for,
+                        self.batch_stall_timeout_sec, len(article_ids),
+                    )
+                    # Cancel via API
+                    self.provider.cancel_batch(batch_id)
+                    self._subtract_enqueued_tokens(batch_id)
+                    # Re-queue articles for a fresh attempt
+                    _re_queue_articles(article_ids, kind)
+                    active_batches.remove(batch_id)
+                    made_progress = True
+                    continue
+
+                # ── Periodic status log ────────────────────────────────────
                 if tick == 1 or (tick % 10 == 0):
                     logger.info(
-                        "Batch %s status=%s (processed=%s) elapsed=%.0fs",
-                        batch_id, state, processed, elapsed,
+                        "Batch %s [%s] status=%s (processed=%s) elapsed=%.0fs stalled=%.0fs",
+                        batch_id, kind, state, processed, elapsed, stalled_for,
                     )
 
             if active_batches:
                 time.sleep(max(10, getattr(self.provider, "poll_interval", 10)))
 
+        # ── Done ──────────────────────────────────────────────────────────
+        self.metrics["final_records"] = len(self.darshan_rows)
+        logger.info("=" * 60)
+        logger.info("PIPELINE COMPLETE")
+        logger.info("=" * 60)
         logger.info(
-            "Classification complete: %d true, %d false",
+            "Classification: %d true, %d false",
             self.metrics["classified_true"],
             self.metrics["classified_false"],
         )
-        return all_extract_ids
-
-    def submit_extraction_batches(self, article_ids: List[str]) -> None:
-        """Submit extraction batches and process results incrementally.
-
-        Same incremental pattern as ``submit_classification_batches``.
-        Instead of returning batch IDs, results are applied directly to
-        ``darshan_rows`` via ``_process_extraction_batch_results``.
-        """
-        if not article_ids:
-            logger.warning("No articles to submit for extraction")
-            return
-
-        batch_articles_all: List[Dict[str, Any]] = []
-        for article_id in article_ids:
-            key = self.article_index.get(article_id)
-            if not key:
-                logger.warning("Article %s not found in cache", article_id)
-                continue
-            batch_articles_all.append(self.processed_articles[key])
-
-        if not batch_articles_all:
-            logger.warning("No articles to submit for extraction")
-            return
-
-        chunks = list(self._chunk_by_token_budget(batch_articles_all, "extraction"))
-        logger.info("Extraction: %d articles in %d batches", len(batch_articles_all), len(chunks))
-
-        active_batches: List[str] = []
-        submit_queue = list(chunks)
-        batch_start: Dict[str, float] = {}
-        last_processed: Dict[str, int] = {}
-        tick = 0
-
-        while submit_queue or active_batches:
-            tick += 1
-            made_progress = False
-
-            while submit_queue and len(active_batches) < self.max_inflight_batches:
-                batch = submit_queue.pop(0)
-                batch_tokens = self._estimate_batch_tokens(batch, "extraction")
-                try:
-                    self._throttle_inflight_and_tpm(active_batches, pending_tokens=batch_tokens)
-                    items = [
-                        {"article_id": a["article_id"], "content": a["content"]}
-                        for a in batch
-                    ]
-                    requests_jsonl = self.provider.build_batch_requests("extraction", items)
-                    batch_id = self.provider.submit_batch(
-                        "extraction", requests_jsonl, max_retries=self.max_retries
-                    )
-                    active_batches.append(batch_id)
-                    batch_start[batch_id] = time.time()
-                    last_processed[batch_id] = -1
-                    self.pending_batches.append({
-                        "kind": "extraction",
-                        "batch_id": batch_id,
-                        "article_ids": [a["article_id"] for a in batch],
-                        "estimated_tokens": batch_tokens,
-                    })
-                    logger.info(
-                        "Submitted extraction batch: %s (%d articles, ~%d tokens)",
-                        batch_id, len(items), batch_tokens,
-                    )
-                except Exception as exc:
-                    self._enqueued_tokens = max(0, self._enqueued_tokens - batch_tokens)
-                    logger.error("Error submitting extraction batch (~%d tokens): %s", batch_tokens, exc)
-
-            if not active_batches:
-                break
-
-            for batch_id in list(active_batches):
-                try:
-                    status = self.provider.get_batch_status(batch_id)
-                except Exception as exc:
-                    logger.error("Error polling extraction batch %s: %s", batch_id, exc)
-                    continue
-
-                state = status.get("status")
-                processed = int(status.get("processed") or 0)
-
-                if processed != last_processed.get(batch_id, -1):
-                    last_processed[batch_id] = processed
-                    made_progress = True
-
-                if state in {"completed", "failed", "expired"}:
-                    self._subtract_enqueued_tokens(batch_id)
-                    active_batches.remove(batch_id)
-                    made_progress = True
-
-                    if state == "completed":
-                        logger.info("Extraction batch %s completed \u2014 processing results", batch_id)
-                        self._process_extraction_batch_results(batch_id)
-                    else:
-                        self._mark_batch_failed(batch_id, reason=f"terminal status {state}")
-
-                    try:
-                        errors = self.provider.get_batch_errors(batch_id)
-                        self._parse_enqueued_limit_from_errors(errors)
-                    except Exception:
-                        pass
-                    continue
-
-                elapsed = time.time() - batch_start.get(batch_id, time.time())
-                if elapsed > self.per_batch_timeout_sec:
-                    logger.error("Extraction batch %s timed out after %.0fs", batch_id, elapsed)
-                    self._subtract_enqueued_tokens(batch_id)
-                    self._mark_batch_failed(batch_id, reason=f"timeout after {elapsed:.0f}s")
-                    active_batches.remove(batch_id)
-                    try:
-                        errors = self.provider.get_batch_errors(batch_id)
-                        self._parse_enqueued_limit_from_errors(errors)
-                    except Exception:
-                        pass
-                    continue
-
-                if tick == 1 or (tick % 10 == 0):
-                    logger.info(
-                        "Batch %s status=%s (processed=%s) elapsed=%.0fs",
-                        batch_id, state, processed, elapsed,
-                    )
-
-            if active_batches:
-                time.sleep(max(10, getattr(self.provider, "poll_interval", 10)))
-
-        self.metrics["final_records"] = len(self.darshan_rows)
         logger.info(
-            "Extraction complete: %d success, %d failed, %d unique dates",
+            "Extraction: %d success, %d failed, %d unique dates",
             self.metrics["extracted_success"],
             self.metrics["extracted_failed"],
             self.metrics["final_records"],
@@ -2014,6 +2033,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--batch-stall-timeout",
+        type=int,
+        default=DEFAULT_BATCH_STALL_TIMEOUT_SEC,
+        help=(
+            f"Seconds without progress after which a batch is considered stalled, "
+            f"cancelled via the API, and retried as new batches. "
+            f"(default: {DEFAULT_BATCH_STALL_TIMEOUT_SEC})"
+        ),
+    )
+    parser.add_argument(
         "--max-enqueued-tokens",
         type=int,
         default=DEFAULT_MAX_ENQUEUED_TOKENS,
@@ -2060,6 +2089,7 @@ def main() -> None:
         tpm_limit=args.tpm_limit,
         tpm_pace_threshold=args.tpm_pace_threshold,
         per_batch_timeout_sec=args.per_batch_timeout,
+        batch_stall_timeout_sec=args.batch_stall_timeout,
         max_enqueued_tokens=args.max_enqueued_tokens,
         enqueued_pace_threshold=args.enqueued_pace_threshold,
     )
@@ -2126,21 +2156,15 @@ def main() -> None:
             processor.print_metrics()
 
         else:
-            # Phase 2: Submit and process classification (batch) incrementally
+            # Phase 2: Run unified batch pipeline (classification + extraction overlap)
             logger.info("=" * 60)
-            logger.info("PHASE 2: CLASSIFICATION")
+            logger.info("PHASE 2: BATCH PIPELINE (classification + extraction)")
             logger.info("=" * 60)
-            classify_article_ids = processor.submit_classification_batches()
+            processor.run_batch_pipeline()
 
-            # Phase 3: Submit and process extraction (batch) incrementally
+            # Phase 3: Save outputs
             logger.info("=" * 60)
-            logger.info("PHASE 3: EXTRACTION")
-            logger.info("=" * 60)
-            processor.submit_extraction_batches(classify_article_ids)
-
-            # Phase 4: Save outputs
-            logger.info("=" * 60)
-            logger.info("PHASE 4: SAVING OUTPUTS")
+            logger.info("PHASE 3: SAVING OUTPUTS")
             logger.info("=" * 60)
             processor.save_outputs()
             processor.save_state()
