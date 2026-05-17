@@ -57,21 +57,21 @@ Key CLI arguments for tuning:
 | Argument | Default | Description |
 |---|---|---|
 | `--max-tokens-per-request` | 4096 | Max tokens of article content per API request. Content beyond this is truncated via tiktoken. |
-| `--max-tokens-per-batch` | 1,500,000 | Max tokens per batch file (25% headroom under OpenAI's 2M per-batch limit). Batches are dynamically sized to fit this budget. |
+| `--max-tokens-per-batch` | 500,000 | Max tokens per batch file. Smaller batches allow 2-3 to run concurrently within the enqueued token budget, preventing a single stuck batch from blocking the pipeline. |
 | `--tpm-limit` | 2,000,000 | Organization TPM (tokens per minute) limit. Used to pace batch submissions. |
-| `--tpm-pace-threshold` | 0.75 | Fraction of TPM at which to start pacing submissions (default: 75%). |
+| `--tpm-pace-threshold` | 0.75 | Fraction of TPM at which to start pacing submissions. |
 | `--per-batch-timeout` | 86400 | Seconds before giving up on a batch (default 24h, matches OpenAI's completion window). Batches at `processed=0` are usually just queued — increase this rather than cancelling. |
 | `--max-enqueued-tokens` | 2,000,000 | Org-level enqueued token limit (from batch error messages). Total tokens across all non-terminal batches must stay under this. |
-| `--enqueued-pace-threshold` | 0.75 | Fraction of enqueued limit at which to pause submissions until batches complete. |
+| `--enqueued-pace-threshold` | 0.90 | Fraction of enqueued limit at which to pause submissions. Increased from 0.75 so more batches can coexist in-flight. |
 
 Example with custom settings:
 
 ```bash
 python process_articles.py ../ttd_scrape/scraped_data \
   --max-tokens-per-request 4096 \
-  --max-tokens-per-batch 1500000 \
-  --tpm-limit 2000000 \
-  --per-batch-timeout 3600
+  --max-tokens-per-batch 500000 \
+  --max-inflight-batches 5 \
+  --per-batch-timeout 86400
 ```
 
 ### Per-Record Mode
@@ -147,7 +147,7 @@ Example safe workflow to stop a run:
 ### Rate limit layers
 
 1. **Per-batch token limit** (2M input tokens): If a batch exceeds this, it fails with `token_limit_exceeded`. Mitigated by token-budget batching (`--max-tokens-per-batch`).
-2. **Enqueued token limit** (2M total): Total tokens across ALL non-terminal batches. If exceeded, new batches are rejected. Mitigated by `--max-enqueued-tokens` and `--enqueued-pace-threshold` — the processor tracks the running total and waits for batches to complete before submitting more.
+2. **Enqueued token limit** (2M total): Total tokens across ALL non-terminal batches. If exceeded, new batches are rejected. The processor now uses **optimistic submission** — it submits batches without proactively blocking on the enqueued budget. If OpenAI rejects a batch with `token_limit_exceeded`, the error handler parses the actual limit and backs off automatically. This prevents a single stuck batch from deadlocking the entire pipeline.
 3. **TPM (Tokens Per Minute)**: Organization-level throughput cap. When exceeded, batches queue at `processed=0`. Mitigated by the TPM sliding-window tracker.
 4. **Enqueued batch count**: Max number of concurrent batch jobs. Mitigated by `--max-inflight-batches`.
 
@@ -159,19 +159,28 @@ TPM snapshots are logged after each batch submission and at the end of the run.
 
 ### Token-budget batching (replaces fixed-size batching)
 
-Instead of grouping articles by a fixed count (`--batch-size 75`), the processor now groups articles by **token budget** (`--max-tokens-per-batch 1500000`). It uses tiktoken to count exact tokens per article and dynamically sizes batches. This ensures no batch exceeds OpenAI's 2M input token limit.
+Instead of grouping articles by a fixed count (`--batch-size 75`), the processor now groups articles by **token budget** (`--max-tokens-per-batch 500000`). It uses tiktoken to count exact tokens per article and dynamically sizes batches. Keeping batches small (500K tokens) allows multiple batches to run concurrently within the org-level enqueued token limit.
 
 ### Content truncation (replaces `[:800]`)
 
 The old hard 800-character truncation has been replaced by **tiktoken-based token budget truncation**. Article content is truncated to `--max-tokens-per-request` tokens (default 4096, ~16K chars), giving the model ~10× more context while keeping costs predictable.
 
+### Incremental per-batch processing
+
+Instead of submitting all batches then processing all results (which could yield 0 output if a single batch gets stuck), the processor now submits batches up to `--max-inflight-batches`, polls them round-robin, and **processes each batch's results immediately upon completion**. As slots free up, remaining batches are submitted. This means:
+
+- If 3 out of 4 batches complete successfully, their results are saved even if batch 4 gets stuck.
+- A stuck batch cannot block results from earlier batches.
+- State is persisted after each extraction batch.
+
 ### How to tune for your environment
 
 | Symptom | Tuning |
 |---|---|
-| Batches stuck at `processed=0` for long periods | Increase `--per-batch-timeout` (try 7200). Lower `--tpm-pace-threshold` (try 0.5). Check `--tpm-limit` matches your tier. |
-| `token_limit_exceeded` errors | Decrease `--max-inflight-batches` (try 1–5). Decrease `--max-tokens-per-batch` (try 500000). |
-| Too many small batches | Increase `--max-tokens-per-batch` (up to 2000000). |
+| Batches stuck at `processed=0` for long periods | Increase `--per-batch-timeout` (default 86400s / 24h). Lower `--tpm-pace-threshold` (try 0.5). Check `--tpm-limit` matches your tier. |
+| `token_limit_exceeded` errors | Decrease `--max-inflight-batches` (try 2–3). Decrease `--max-tokens-per-batch` (try 250000). |
+| Too many small batches | Increase `--max-tokens-per-batch` (try 1000000). |
+| Pipeline deadlocked on one stuck batch | Fixed by incremental processing — earlier batches' results are already saved. If the stuck batch times out (24h), remaining articles are marked failed and processing continues. |
 | Per-record mode hitting rate limits | The TPM tracker also paces per-record requests. Adjust `--tpm-limit` and `--tpm-pace-threshold`. |
 
 Example restart with conservative throttling:
