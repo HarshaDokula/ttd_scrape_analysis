@@ -3,6 +3,7 @@
 tests
 
 # Output data files for this project.
+output/
 *.json
 *.pkl
 *.csv
@@ -15,6 +16,7 @@ logs/
 
 # Pi agent generated docs
 docs/
+*.html
 
 # Test data
 example_data/*

@@ -6,22 +6,6 @@ from datetime import datetime
 import pandas as pd
 
 
-DEFAULT_DATA_FILES = [
-    Path("full_run_1/darshan_data_full_run.json"),
-    Path("darshan_data.json"),
-]
-OUTPUT_FILE = Path("darshan_visualization.html")
-
-
-def find_default_data_file() -> Path:
-    for path in DEFAULT_DATA_FILES:
-        if path.exists():
-            return path
-    raise FileNotFoundError(
-        "No darshan data file was found. Create darshan_data.json or use full_run_1/darshan_data_full_run.json."
-    )
-
-
 def load_darshan_data(data_path: Path) -> pd.DataFrame:
     with open(data_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -43,14 +27,8 @@ def load_darshan_data(data_path: Path) -> pd.DataFrame:
             {
                 "date": date.strftime("%Y-%m-%d"),
                 "year": date.year,
-                # FIX 3: removed unused "month" field — it was serialized into
-                # every row's JSON but never read by the JS. Dropping it reduces
-                # page payload size, especially for large datasets.
                 "year_month": date.strftime("%Y-%m"),
                 "pilgrim_count": pilgrim_count,
-                # FIX 4: kept article_id and title (small strings, useful for
-                # click-through tooltips) but dropped "post" (can be very long
-                # and bloats the embedded JSON significantly when unused).
                 "article_id": record.get("article_id"),
                 "title": record.get("title"),
             }
@@ -75,12 +53,8 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <!-- FIX 7: viewport meta tag so the 3-column month grid is readable on mobile -->
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>TTD Darshan Visualization</title>
-  <!-- FIX 1: pin to a specific Plotly version instead of plotly-latest.min.js.
-       "latest" is a moving target — a breaking Plotly release would silently
-       break all charts. Pinning guarantees reproducible behaviour. -->
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; }
@@ -93,7 +67,6 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
     .tab-button.active { background: #007bff; color: white; border-color: #007bff; }
     .hidden { display: none; }
     .month-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
-    /* FIX 7: collapse to 1 column on narrow screens */
     @media (max-width: 700px) { .month-grid { grid-template-columns: 1fr; } }
     .month-chart { border: 1px solid #ddd; border-radius: 4px; padding: 0.5rem; background: white; }
     .month-chart h3 { margin: 0 0 0.5rem 0; font-size: 1rem; text-align: center; }
@@ -141,25 +114,16 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
     const yearChartsSection = document.getElementById('year-charts-section');
     const yearChartsDiv     = document.getElementById('year-charts');
 
-    // Tracks chart IDs currently rendered in the year grid so we can purge
-    // them before rebuilding — see FIX 5.
     let activeYearChartIds = [];
 
-    // FIX 1 (date): Use local Date constructor to avoid UTC midnight shift.
-    // new Date("YYYY-MM-01") parses as UTC, which in timezones behind UTC
-    // (e.g. US/Central = UTC-6) becomes the previous day locally, causing
-    // December to display as November, etc.
     function formatMonth(value) {
       const parts = value.split('-');
       const year  = parseInt(parts[0], 10);
       const month = parseInt(parts[1], 10);
-      const date  = new Date(year, month - 1, 1); // local time — no UTC offset
+      const date  = new Date(year, month - 1, 1);
       return date.toLocaleString('default', { month: 'short' }) + ' ' + year;
     }
 
-    // FIX 6: safe max using reduce — avoids the RangeError that Math.max(...array)
-    // throws when the spread operator exceeds the JS engine's argument stack limit
-    // (~65k–100k items). reduce() iterates without spreading into call arguments.
     function safeMax(arr, key) {
       return arr.reduce((max, row) => (row[key] > max ? row[key] : max), -Infinity);
     }
@@ -168,17 +132,11 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
       return rows.filter(row => row.year_month === yearMonth);
     }
 
-    // FIX 2: removed dead getYearData() function — it was defined but never
-    // called anywhere; buildYearCharts() filtered rows inline instead.
-
     function populateMonthYearOptions() {
       const yearsWithData = Object.keys(yearMonthMap).sort();
       monthYearSelect.innerHTML = yearsWithData
         .map(year => `<option value="${year}">${year}</option>`)
         .join('');
-      // FIX 2 (select): assign .value AFTER setting innerHTML.
-      // Assigning before options exist is silently ignored by the browser,
-      // leaving .value as "" and causing charts to filter on a blank key.
       if (yearsWithData.length > 0) {
         monthYearSelect.value = yearsWithData[0];
         populateMonthMonthOptions(yearsWithData[0]);
@@ -190,7 +148,6 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
       monthMonthSelect.innerHTML = filtered
         .map(value => `<option value="${value}">${formatMonth(value)}</option>`)
         .join('');
-      // FIX 2 (select): assign after innerHTML
       if (filtered.length > 0) {
         monthMonthSelect.value = filtered[0];
       }
@@ -200,9 +157,6 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
       yearYearSelect.innerHTML = years
         .map(year => `<option value="${String(year)}">${year}</option>`)
         .join('');
-      // FIX 2 (select): assign after innerHTML.
-      // FIX 3 (default year): default to the most recent year so the first
-      // view shows the latest data rather than the oldest (which may be sparse).
       if (years.length > 0) {
         yearYearSelect.value = String(years[years.length - 1]);
       }
@@ -210,10 +164,8 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
 
     function buildMonthChart() {
       const selectedMonth = monthMonthSelect.value;
-      if (!selectedMonth) return; // guard against blank value during init
+      if (!selectedMonth) return;
 
-      // Filter nulls before safeMax — a null pilgrim_count would produce NaN,
-      // breaking chart title, highlight colours, and axis range.
       const data = getMonthData(selectedMonth)
         .filter(row => row.pilgrim_count != null);
 
@@ -222,13 +174,10 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
         return;
       }
 
-      // FIX 6: use safeMax instead of Math.max(...array)
       const maxCount = safeMax(data, 'pilgrim_count');
       const x      = data.map(row => row.date);
       const y      = data.map(row => row.pilgrim_count);
       const colors = data.map(row => row.pilgrim_count === maxCount ? '#ff6b6b' : '#007bff');
-
-      // FIX 4: surface article title in hover tooltip when available
       const customdata = data.map(row => row.title || '');
 
       Plotly.react('chart', [{
@@ -250,13 +199,8 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
 
     function buildYearCharts() {
       const selectedYear = String(yearYearSelect.value);
-      // Guard: blank or "undefined" means options weren't populated yet
       if (!selectedYear || selectedYear === 'undefined') return;
 
-      // FIX 5: purge existing Plotly charts before wiping innerHTML.
-      // Plotly keeps an internal registry keyed by element ID. Removing the
-      // DOM nodes via innerHTML = '' without purging leaks those entries;
-      // over repeated tab switches this accumulates unboundedly.
       activeYearChartIds.forEach(id => {
         const el = document.getElementById(id);
         if (el) Plotly.purge(el);
@@ -268,13 +212,10 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
         const monthStr = String(m).padStart(2, '0');
         const month    = `${selectedYear}-${monthStr}`;
 
-        // Filter nulls before safeMax
         const monthData = rows.filter(
           row => row.year_month === month && row.pilgrim_count != null
         );
 
-        // FIX 5 (ID): use replaceAll to strip ALL hyphens — replace() only
-        // removes the first one, which works today but is semantically wrong.
         const chartId = `chart-${month.replaceAll('-', '')}`;
         activeYearChartIds.push(chartId);
 
@@ -295,12 +236,10 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
           continue;
         }
 
-        // FIX 6: use safeMax instead of Math.max(...array)
         const maxCount   = safeMax(monthData, 'pilgrim_count');
         const x          = monthData.map(row => row.date);
         const y          = monthData.map(row => row.pilgrim_count);
         const colors     = monthData.map(row => row.pilgrim_count === maxCount ? '#ff6b6b' : '#007bff');
-        // FIX 4: surface title in year-grid tooltips too
         const customdata = monthData.map(row => row.title || '');
 
         Plotly.newPlot(chartId, [{
@@ -371,24 +310,25 @@ def render_output(df: pd.DataFrame, html_file: Path, data_file: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate interactive TTD Darshan visualization.")
+    parser = argparse.ArgumentParser(
+        description="Generate interactive TTD Darshan visualization from a data JSON file."
+    )
     parser.add_argument(
         "--data-file",
         type=Path,
-        default=None,
-        help="Path to the darshan JSON file. Defaults to full_run_1/darshan_data_full_run.json if available, otherwise darshan_data.json.",
+        required=True,
+        help="Path to the darshan JSON file (e.g. output/run_*/darshan_data.json).",
     )
     parser.add_argument(
         "--output-file",
         type=Path,
-        default=OUTPUT_FILE,
-        help="Output HTML file path.",
+        default=Path("darshan_visualization.html"),
+        help="Output HTML file path (default: darshan_visualization.html).",
     )
     args = parser.parse_args()
 
-    data_file = args.data_file or find_default_data_file()
-    df = load_darshan_data(data_file)
-    render_output(df, args.output_file, data_file)
+    df = load_darshan_data(args.data_file)
+    render_output(df, args.output_file, args.data_file)
 
 
 if __name__ == "__main__":
