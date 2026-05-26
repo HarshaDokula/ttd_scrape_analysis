@@ -1,98 +1,40 @@
-ttd_prompt_tmpl = '''
-You are a classifier for news articles from the Tirumala Tirupati Devasthanams (TTD).
+ttd_prompt_tmpl3 = '''
+You are a strict classifier for Tirumala Tirupati Devasthanams (TTD) news articles.
+
 ### TASK
-Given an article title and article text, return true or false following these rules:
+Return ONLY the token "true" or "false" (lowercase) and nothing else.
 
 ### RULES
-- true: Daily/periodic pilgrim statistics at Tirumala, e.g., "About 64,801 pilgrims had Srivari darshan..."
-- false: All other news (festivals, dignitaries visits, events, admin notices, etc.).
+- "true": Only if the article title or text contains an ACTUAL DAILY PILGRIM COUNT (e.g., "About 64,801 pilgrims", "52,643 pilgrims at Srivari darshan").
+- "false": Everything else, including:
+  - Ticket releases, booking announcements, online DIP, or administrative logistics
+  - Festival/event descriptions, maintenance notices, or dignitary visits
+  - General news about arrangements, facilities, or pilgrim guidance without concrete counts
+  - Articles mentioning pilgrims without an explicit count number
+
+CRITICAL: Focus on the first {token_budget} tokens of the article text. Disallow any explanation or extra context beyond "true"/"false".
 
 Title: {title}
 Article text: {article_text}
+Answer:
 '''
 
-
-ttd_prompt_tmpl2 = '''
-You are a classifier for news articles from the Tirumala Tirupati Devasthanams (TTD).
+ttd_info_extract_prompt_tmpl_v2 = '''
+You are a precise JSON extractor for Tirumala Tirupati Devasthanams (TTD) pilgrim reports.
 
 ### TASK
-Given an article title and article text, return true or false following these rules:
+Return a single JSON object with keys "day", "pilgrim_count", and "other_metrics".
+- day: numeric day extracted from the article text (1-31) or null if missing.
+- pilgrim_count: integer count of pilgrims noted in the article.
+- other_metrics: a dictionary of any additional numeric or descriptive metrics found (use empty object {{}} if none).
 
 ### RULES
-- true: If the Title or Article text contains information on count of pilgrims visiting Tirumala, e.g., "About 64,801 pilgrims.."
-- false: Anything other than information on people count.
-
-### EXAMPLES
-Title: About 23,423 pilgrims had Srivari Darshan from 3am to 6pm on October 31
-Article text: About 23,423 pilgrims had Srivari Darshan from 3am to 6pm on October 31. Current Situation of Pilgrim darshan particulars of various categories of darshan line with waiting compartments and waiting hours details-Sarva Darshan (Free darshan)- 6 compartments/4 hours; Divya Darshan (Footpath darshan)- 3 compartments/2 hours; Special Entry Darshan (Rs.300 Darshan) closed.
-
-answer: true
-
-Title: SRI B.VENKATESWARA RAO SWORN IN AS TTD BOARD EX-OFFICIO
-Article text: TIRUMALA, Oct 31: The 1993-Batch IAS Officer, Sri Busani.Venkateswara Rao, the Secretary to Revenue Endowment, Govt. of AP, sworn in as the ex-officio member of TTD trust board on Thursday. The TTD Executive officer Sri M.G.Gopal administered the oath of office to Sri Venkateswara Rao at the Bangaru Vakili of Tirumala temple on Thursday night at.
-
-answer: false
-
-### QUESTION
-Title: {title}
-Article text: {article_text}
-
-answer:
-'''
-
-# ttd_info_extract_prompt_tmpl = '''
-# You are an information extractor for news articles from the Tirumala Tirupati Devasthanams (TTD).
-
-# Your task is to extract the following information from the article text following these rules:
-# - A JSON Date of the article. For any missing parts of the date (year, month, or day), use 0. For example, if only "September 31" is provided, output {{"date":{{"year":null,"month":9,"day":31}}}}; if all parts are present, use them.
-# - Number of pilgrims visiting Tirumala in the article text
-# - Any other relevant metrics mentioned in the article
-# - If the article does not contain any of the above information, return null for each field.
-# - DO not deviate from the rules or create incorrect information.
-
-# ### OUTPUT FORMAT
-# Return a JSON object with the following fields:
-# ```json
-# {{
-#     "date":{{
-#         "year": <digit year from the article content or 0 if not present>,
-#         "month": <digit month from the article or 0 if not present>,
-#         "day": <digit day from the article content or 0 if not present>
-#     }},
-#     "pilgrim_count": <number>,
-#     "other_metrics": <any other relevant metrics>
-# }}
-# ```
-
-# ### INPUT
-# Aritcle text: {article_text}
-
-# Here's the json object with the extracted information:
-# '''
-
-ttd_info_extract_prompt_tmpl = '''
-You are an information extractor for news articles from the Tirumala Tirupati Devasthanams (TTD).
-
-Your task is to extract the following information from the article text following these rules:
-- Day of the article. If the day is not present in the article, use null. For example, if only "September" is provided, output {{"day":null}}; if the text contains "September 9", output {{"day":9}}.
-- Number of pilgrims visiting Tirumala in the article text
-- Any other relevant metrics mentioned in the article
-- If the article does not contain any of the above information, return null for each field.
-- DO not deviate from the rules or create incorrect information.
-
-### OUTPUT FORMAT
-Return a JSON object with the following fields:
-```json
-{{
-    
-    "day": <digit day from the article content or null if not present>,
-    "pilgrim_count": <number>,
-    "other_metrics": <any other relevant metrics>
-}}
-```
+- Output nothing but the JSON object (no prose, no markdown).
+- Strip any enclosing triple backticks or stop tokens before parsing the JSON.
+- If a field is missing, use null (day), 0 (pilgrim_count), or {{}} (other_metrics).
 
 ### INPUT
-Aritcle text: {article_text}
+Article text (first {token_budget} tokens): {article_text}
 
-Here's the json object with the extracted information:
-```json'''
+Return the JSON object now.
+'''

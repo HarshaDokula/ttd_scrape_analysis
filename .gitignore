@@ -1,7 +1,21 @@
+#tests
+
+tests
+
 # Output data files for this project.
 output/
 *.json
 *.pkl
+*.csv
+nohup.out
+
+# Run output directories (generated processing data)
+output/
+full_run_1/
+logs/
+
+# Pi agent generated docs
+docs/
 *.html
 
 # Test data
@@ -153,6 +167,7 @@ ENV/
 env.bak/
 venv.bak/
 *_env
+*_venv
 
 # Spyder project settings
 .spyderproject
