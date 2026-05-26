@@ -87,7 +87,7 @@ class ProcessorState:
     failed_records: List[Dict[str, Any]]
     metrics: Dict[str, int]
     pending_batches: List[Dict[str, Any]]
-    duplicate_articles: List[Dict[str, Any]]
+    date_duplicates: Dict[str, List[Dict[str, Any]]]
 
 
 # Rate-limit thresholds for OpenAI gpt-4o-mini.
@@ -292,7 +292,7 @@ class BatchProcessor:
         # Outputs
         self.darshan_rows: Dict[str, Dict[str, Any]] = {}
         self.failed_records: List[Dict[str, Any]] = []
-        self.duplicate_articles: List[Dict[str, Any]] = []
+        self.date_duplicates: Dict[str, List[Dict[str, Any]]] = {}
 
         # Batch bookkeeping (for logging/persistence)
         self.pending_batches: List[Dict[str, Any]] = []
@@ -409,17 +409,6 @@ class BatchProcessor:
             return
 
         if article_id in self.article_index:
-            # Capture duplicates to a separate file so data is not lost
-            logger.debug("Duplicate article_id %s — recording to duplicate_articles", article_id)
-            self.duplicate_articles.append({
-                "article_id": article_id,
-                "title": title,
-                "content": content[:500] if len(content) > 500 else content,
-                "link": link,
-                "year": year,
-                "month": month,
-                "duplicate_of": self.article_index.get(article_id, ""),
-            })
             return
 
         key = f"{year}_{month}_{article_id}"
@@ -1568,13 +1557,29 @@ class BatchProcessor:
                 },
             }
 
-            # Keep highest pilgrim_count per date
+            # Keep highest pilgrim_count per date; record displaced articles
             if date_iso in self.darshan_rows:
                 existing_count = self.darshan_rows[date_iso]["data"].get(
                     "pilgrim_count", 0
                 )
                 if pilgrim_count > existing_count:
+                    old = self.darshan_rows[date_iso]
+                    self.date_duplicates.setdefault(date_iso, []).append({
+                        "article_id": old["article_id"],
+                        "title": old["title"],
+                        "post": old["post"],
+                        "pilgrim_count": old["data"]["pilgrim_count"],
+                        "reason": "replaced by higher pilgrim_count",
+                    })
                     self.darshan_rows[date_iso] = payload
+                else:
+                    self.date_duplicates.setdefault(date_iso, []).append({
+                        "article_id": article_id,
+                        "title": article["title"],
+                        "post": article["link"],
+                        "pilgrim_count": pilgrim_count,
+                        "reason": "lower pilgrim_count, existing kept",
+                    })
             else:
                 self.darshan_rows[date_iso] = payload
 
@@ -1836,7 +1841,7 @@ class BatchProcessor:
             failed_records=self.failed_records,
             metrics=self.metrics,
             pending_batches=self.pending_batches,
-            duplicate_articles=self.duplicate_articles,
+            date_duplicates=self.date_duplicates,
         )
 
     def save_state(self) -> None:
@@ -1876,7 +1881,7 @@ class BatchProcessor:
         self.failed_records = state.failed_records
         self.metrics = state.metrics
         self.pending_batches = state.pending_batches
-        self.duplicate_articles = state.duplicate_articles
+        self.date_duplicates = state.date_duplicates
 
         # Make future saves/outputs land next to this state file.
         self.state_path = state_path
@@ -1891,7 +1896,7 @@ class BatchProcessor:
         )
 
     def save_outputs(self) -> None:
-        """Save darshan_data.json, run_metadata.json, data_duplicates.json, and failed_records_*.csv."""
+        """Save darshan_data.json, run_metadata.json, date_duplicates.json, and failed_records_*.csv."""
 
         now_iso = datetime.now().isoformat()
         elapsed_sec = time.time() - self._start_time
@@ -1913,7 +1918,7 @@ class BatchProcessor:
             "file_outputs": {
                 "darshan_data": str(self.output_dir / "darshan_data.json"),
                 "darshan_state": str(self.state_path),
-                "data_duplicates": str(self.output_dir / "data_duplicates.json"),
+                "date_duplicates": str(self.output_dir / "date_duplicates.json"),
             },
         }
         with meta_path.open("w", encoding="utf-8") as f:
@@ -1930,13 +1935,13 @@ class BatchProcessor:
             output_path,
         )
 
-        # Save duplicate articles
-        dup_path = self.output_dir / "data_duplicates.json"
+        # Save date duplicates
+        dup_path = self.output_dir / "date_duplicates.json"
         with dup_path.open("w", encoding="utf-8") as f:
-            json.dump(self.duplicate_articles, f, ensure_ascii=False, indent=2)
+            json.dump(self.date_duplicates, f, ensure_ascii=False, indent=2)
         logger.info(
-            "Saved %d duplicate articles to %s",
-            len(self.duplicate_articles),
+            "Saved date-duplicate records for %d dates to %s",
+            len(self.date_duplicates),
             dup_path,
         )
 
@@ -1983,7 +1988,8 @@ class BatchProcessor:
         )
         logger.info("Invalid dates (no day):     %d", self.metrics["invalid_date"])
         logger.info("Final unique dates:         %d", self.metrics["final_records"])
-        logger.info("Duplicate articles found:    %d", len(self.duplicate_articles))
+        total_displaced = sum(len(v) for v in self.date_duplicates.values())
+        logger.info("Duplicate dates found:       %d (%d total displaced)", len(self.date_duplicates), total_displaced)
         logger.info("Total failed records:       %d", len(self.failed_records))
         logger.info("Total API requests:         %d", self._total_requests)
 
