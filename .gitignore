@@ -1,6 +1,8 @@
 # Output data files for this project.
+output/
 *.json
 *.pkl
+*.html
 
 # Test data
 example_data/*
