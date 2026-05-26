@@ -87,6 +87,7 @@ class ProcessorState:
     failed_records: List[Dict[str, Any]]
     metrics: Dict[str, int]
     pending_batches: List[Dict[str, Any]]
+    duplicate_articles: List[Dict[str, Any]]
 
 
 # Rate-limit thresholds for OpenAI gpt-4o-mini.
@@ -202,6 +203,10 @@ class BatchProcessor:
         max_retries: int = 3,
         max_inflight_batches: int = 10,
         state_path: Optional[Path] = None,
+        data_dir: Optional[Path] = None,
+        retry_failed_path: Optional[Path] = None,
+        resume_from_state_path: Optional[Path] = None,
+        per_record_mode: bool = False,
         # ── Token-aware parameters ─────────────────────────────────────────
         max_tokens_per_request: int = DEFAULT_MAX_TOKENS_PER_REQUEST,
         max_tokens_per_batch: int = DEFAULT_MAX_TOKENS_PER_BATCH,
@@ -243,6 +248,26 @@ class BatchProcessor:
         self.enqueued_pace_threshold = enqueued_pace_threshold
         self._enqueued_tokens: int = 0  # running total of enqueued tokens
 
+        # Record run configuration for metadata output
+        self._start_time: float = time.time()
+        self._run_params: Dict[str, Any] = {
+            "batch_size": batch_size,
+            "max_retries": max_retries,
+            "max_inflight_batches": max_inflight_batches,
+            "max_tokens_per_request": max_tokens_per_request,
+            "max_tokens_per_batch": max_tokens_per_batch,
+            "tpm_limit": tpm_limit,
+            "tpm_pace_threshold": tpm_pace_threshold,
+            "per_batch_timeout_sec": per_batch_timeout_sec,
+            "batch_stall_timeout_sec": batch_stall_timeout_sec,
+            "max_enqueued_tokens": max_enqueued_tokens,
+            "enqueued_pace_threshold": enqueued_pace_threshold,
+            "per_record_mode": per_record_mode,
+            "data_dir": str(data_dir) if data_dir else None,
+            "retry_failed_path": str(retry_failed_path) if retry_failed_path else None,
+            "resume_from_state_path": str(resume_from_state_path) if resume_from_state_path else None,
+        }
+
         # Push token budget to provider (so it can truncate content accordingly)
         if hasattr(self.provider, "max_tokens_per_request"):
             self.provider.max_tokens_per_request = max_tokens_per_request
@@ -267,6 +292,7 @@ class BatchProcessor:
         # Outputs
         self.darshan_rows: Dict[str, Dict[str, Any]] = {}
         self.failed_records: List[Dict[str, Any]] = []
+        self.duplicate_articles: List[Dict[str, Any]] = []
 
         # Batch bookkeeping (for logging/persistence)
         self.pending_batches: List[Dict[str, Any]] = []
@@ -287,6 +313,9 @@ class BatchProcessor:
         # Rate-limit tracking: total requests made in this session
         self._total_requests: int = 0
         self._last_rpd_warning_pct: float = 0.0
+
+        # Record start-of-run metrics for metadata
+        self._initial_metrics: Dict[str, int] = dict(self.metrics)
 
         # Sync with OpenAI's actual enqueued state at startup
         self._sync_enqueued_state()
@@ -380,8 +409,17 @@ class BatchProcessor:
             return
 
         if article_id in self.article_index:
-            # Deduplicate by article_id as per spec
-            logger.debug("Skipping duplicate article_id %s", article_id)
+            # Capture duplicates to a separate file so data is not lost
+            logger.debug("Duplicate article_id %s — recording to duplicate_articles", article_id)
+            self.duplicate_articles.append({
+                "article_id": article_id,
+                "title": title,
+                "content": content[:500] if len(content) > 500 else content,
+                "link": link,
+                "year": year,
+                "month": month,
+                "duplicate_of": self.article_index.get(article_id, ""),
+            })
             return
 
         key = f"{year}_{month}_{article_id}"
@@ -1798,6 +1836,7 @@ class BatchProcessor:
             failed_records=self.failed_records,
             metrics=self.metrics,
             pending_batches=self.pending_batches,
+            duplicate_articles=self.duplicate_articles,
         )
 
     def save_state(self) -> None:
@@ -1837,6 +1876,7 @@ class BatchProcessor:
         self.failed_records = state.failed_records
         self.metrics = state.metrics
         self.pending_batches = state.pending_batches
+        self.duplicate_articles = state.duplicate_articles
 
         # Make future saves/outputs land next to this state file.
         self.state_path = state_path
@@ -1851,7 +1891,34 @@ class BatchProcessor:
         )
 
     def save_outputs(self) -> None:
-        """Save darshan_data.json and failed_records_*.csv."""
+        """Save darshan_data.json, run_metadata.json, data_duplicates.json, and failed_records_*.csv."""
+
+        now_iso = datetime.now().isoformat()
+        elapsed_sec = time.time() - self._start_time
+        provider_name = type(self.provider).__name__ if self.provider else "unknown"
+
+        # Save run_metadata.json
+        meta_path = self.output_dir / "run_metadata.json"
+        metadata = {
+            "run_label": _RUN_LABEL,
+            "start_time": datetime.fromtimestamp(self._start_time).isoformat(),
+            "end_time": now_iso,
+            "elapsed_seconds": round(elapsed_sec, 2),
+            "elapsed_formatted": self._format_duration(elapsed_sec),
+            "output_dir": str(self.output_dir),
+            "provider": provider_name,
+            "parameters": dict(self._run_params),
+            "initial_metrics": dict(self._initial_metrics),
+            "final_metrics": dict(self.metrics),
+            "file_outputs": {
+                "darshan_data": str(self.output_dir / "darshan_data.json"),
+                "darshan_state": str(self.state_path),
+                "data_duplicates": str(self.output_dir / "data_duplicates.json"),
+            },
+        }
+        with meta_path.open("w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        logger.info("Saved run metadata to %s", meta_path)
 
         # Save darshan_data.json
         output_path = self.output_dir / "darshan_data.json"
@@ -1861,6 +1928,16 @@ class BatchProcessor:
             "Saved %d Darshan records to %s",
             len(self.darshan_rows),
             output_path,
+        )
+
+        # Save duplicate articles
+        dup_path = self.output_dir / "data_duplicates.json"
+        with dup_path.open("w", encoding="utf-8") as f:
+            json.dump(self.duplicate_articles, f, ensure_ascii=False, indent=2)
+        logger.info(
+            "Saved %d duplicate articles to %s",
+            len(self.duplicate_articles),
+            dup_path,
         )
 
         # Save failed records
@@ -1876,12 +1953,25 @@ class BatchProcessor:
                 "Saved %d failed records to %s", len(self.failed_records), failed_path
             )
 
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """Format a duration in seconds to a human-readable string."""
+        hours, remainder = divmod(int(seconds), 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m {secs}s"
+        if minutes > 0:
+            return f"{minutes}m {secs}s"
+        return f"{secs}s"
+
     def print_metrics(self) -> None:
         """Print processing metrics."""
 
+        elapsed = time.time() - self._start_time
         logger.info("=" * 60)
         logger.info("PROCESSING METRICS")
         logger.info("=" * 60)
+        logger.info("Run duration:               %s", self._format_duration(elapsed))
         logger.info("Total articles loaded:      %d", self.metrics["total_loaded"])
         logger.info("Classified as TRUE:         %d", self.metrics["classified_true"])
         logger.info("Classified as FALSE:        %d", self.metrics["classified_false"])
@@ -1893,6 +1983,7 @@ class BatchProcessor:
         )
         logger.info("Invalid dates (no day):     %d", self.metrics["invalid_date"])
         logger.info("Final unique dates:         %d", self.metrics["final_records"])
+        logger.info("Duplicate articles found:    %d", len(self.duplicate_articles))
         logger.info("Total failed records:       %d", len(self.failed_records))
         logger.info("Total API requests:         %d", self._total_requests)
 
@@ -2083,6 +2174,10 @@ def main() -> None:
         max_retries=args.max_retries,
         max_inflight_batches=args.max_inflight_batches,
         state_path=Path(args.state_file) if args.state_file else None,
+        data_dir=data_dir,
+        retry_failed_path=Path(args.retry_failed) if args.retry_failed else None,
+        resume_from_state_path=Path(args.resume_from_state) if args.resume_from_state else None,
+        per_record_mode=args.per_record,
         # ── Token-aware parameters ────────────────────────────────────────
         max_tokens_per_request=args.max_tokens_per_request,
         max_tokens_per_batch=args.max_tokens_per_batch,
