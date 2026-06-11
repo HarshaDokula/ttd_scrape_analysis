@@ -36,7 +36,7 @@ jobs:
       - name: Prepare deployment
         run: |
           mkdir -p _site
-          cp -r * _site/
+          rsync -av --exclude='_site' ./ _site/
           mv _site/darshan_visualization.html _site/index.html
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
