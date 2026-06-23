@@ -2,8 +2,7 @@ name: Deploy static content to Pages
 
 on:
   push:
-    branches:
-      - main
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -24,44 +23,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v5
 
-      - name: Prepare site
+      - name: Prepare deployment
         run: |
-          mkdir _site
+          mkdir -p _site
+          cp darshan_visualization.html _site/index.html
 
-          # Copy everything except .git and _site itself
-          rsync -av \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='_site' \
-            ./ _site/
-
-          # Make your visualization page the homepage
-          mv _site/darshan_visualization.html _site/index.html
-
-      - name: Verify contents
-        run: |
-          echo "===== Files being deployed ====="
-          find _site | sort
-
-          echo "===== Checking CNAME ====="
-          if [ -f _site/CNAME ]; then
-            echo "Unexpected CNAME found:"
-            cat _site/CNAME
-          else
-            echo "No CNAME file present"
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
 
-      - name: Deploy to GitHub Pages
-        id: deployment
+      - id: deployment
         uses: actions/deploy-pages@v5
